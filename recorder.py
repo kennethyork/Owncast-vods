@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import html
 import json
+import xml.etree.ElementTree as ET
 import os
 import re
 import secrets
@@ -42,6 +43,9 @@ LIVE_URL = os.environ.get("LIVE_URL", "/")  # "back to live" link
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")  # optional ?token=...
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # download gate; empty = open
+# WebDAV base URL served by the rclone backup container (cloud playback).
+# Empty string disables cloud listing entirely.
+CLOUD_URL = os.environ.get("CLOUD_URL", "").rstrip("/")  # e.g. http://127.0.0.1:8091
 
 FILE_RE = re.compile(r"^vod_(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})\.mp4$")
 
@@ -207,6 +211,82 @@ def human(n):
     return f"{n:.1f} PB"
 
 
+# ---------------------------------------------------------- cloud listing ----
+import xml.etree.ElementTree as ET
+
+_cloud_cache: list = []
+_cloud_cache_time: float = 0.0
+_CLOUD_TTL = 60  # seconds between WebDAV PROPFIND calls
+
+_DAV_NS = "DAV:"
+
+
+def _propfind(url: str) -> list:
+    """Return list of dicts {name, size} from a WebDAV PROPFIND response."""
+    req = urllib.request.Request(
+        url + "/",
+        method="PROPFIND",
+        headers={"Depth": "1", "Content-Type": "application/xml"},
+        data=b'<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop>'
+             b'<D:displayname/><D:getcontentlength/></D:prop></D:propfind>',
+    )
+    with urllib.request.urlopen(req, timeout=8) as r:
+        body = r.read()
+    root = ET.fromstring(body)
+    out = []
+    for resp in root.iter(f"{{{_DAV_NS}}}response"):
+        href = (resp.findtext(f"{{{_DAV_NS}}}href") or "").rstrip("/")
+        name = href.rsplit("/", 1)[-1]
+        if not FILE_RE.match(name):
+            continue
+        cl = resp.findtext(
+            f"{{{_DAV_NS}}}propstat/{{{_DAV_NS}}}prop/{{{_DAV_NS}}}getcontentlength"
+        ) or "0"
+        out.append({"name": name, "size": int(cl)})
+    return out
+
+
+def list_cloud_vods() -> list:
+    """Return cloud-only VODs (not present locally), cached for _CLOUD_TTL seconds."""
+    global _cloud_cache, _cloud_cache_time
+    if not CLOUD_URL:
+        return []
+    now = time.time()
+    if now - _cloud_cache_time < _CLOUD_TTL:
+        return _cloud_cache
+    try:
+        remote = _propfind(CLOUD_URL)
+        local_names = {v["name"] for v in list_vods()}
+        result = []
+        for f in remote:
+            if f["name"] not in local_names:
+                m = FILE_RE.match(f["name"])
+                result.append({
+                    "name": f["name"],
+                    "date": m.group(1),
+                    "start": f"{m.group(2)}:{m.group(3)}",
+                    "size": f["size"],
+                    "mtime": 0.0,
+                    "cloud": True,
+                })
+        result.sort(key=lambda v: v["name"], reverse=True)
+        _cloud_cache = result
+        _cloud_cache_time = now
+        return result
+    except Exception as e:
+        log("cloud list failed:", e)
+        return _cloud_cache  # stale is better than nothing
+
+
+def merged_vods() -> list:
+    """Local VODs first, then cloud-only ones, sorted newest-first."""
+    local = list_vods()
+    cloud = list_cloud_vods()
+    combined = local + cloud
+    combined.sort(key=lambda v: v["name"], reverse=True)
+    return combined
+
+
 # ------------------------------------------------------------------ http ----
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -231,7 +311,7 @@ a{{color:#8ab4f8}} small{{color:#888}}
 <script>
 document.querySelectorAll('.v').forEach(r=>r.onclick=e=>{{
  if(e.target.tagName==='A'||e.target.closest('button'))return;const p=document.getElementById('p');
- p.style.display='block';p.src='/vods/'+r.dataset.f;p.play();scrollTo(0,0);}});
+ p.style.display='block';p.src=r.dataset.f;p.play();scrollTo(0,0);}});
 {login_js}
 </script></body></html>"""
 
@@ -243,8 +323,9 @@ LOGIN_MODAL = """<div id="modal"><div id="mbox">
 </div></div>"""
 
 LOGIN_JS = """
-var _dlFile=null;
-function openLogin(f){_dlFile=f;document.getElementById('modal').classList.add('open');
+var _dlFile=null,_dlCloud=false;
+function openLogin(f,cloud){_dlFile=f;_dlCloud=cloud||false;
+  document.getElementById('modal').classList.add('open');
   setTimeout(()=>document.getElementById('mpw').focus(),50);}
 document.getElementById('modal').onclick=function(e){if(e.target===this)this.classList.remove('open');};
 document.getElementById('mpw').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
@@ -254,7 +335,9 @@ function doLogin(){
   .then(r=>r.json()).then(d=>{
     if(d.ok){document.getElementById('modal').classList.remove('open');
               document.getElementById('mpw').value='';
-              if(_dlFile){var a=document.createElement('a');a.href='/vods/download/'+_dlFile;a.download=_dlFile;a.click();}
+              if(_dlFile){var a=document.createElement('a');
+                a.href=_dlCloud?'/vods/cloud/'+_dlFile+'?dl=1':'/vods/download/'+_dlFile;
+                a.download=_dlFile;a.click();}
     }else{document.getElementById('merr').textContent='Wrong password.';}
   });
 }"""
@@ -264,7 +347,7 @@ OPEN_DOWNLOAD_JS = ""  # no modal needed when downloads are open
 
 def render_page(authed: bool = False):
     """authed=True means the request already has a valid admin cookie."""
-    vods = list_vods()
+    vods = merged_vods()
     if not vods:
         rows = "<p>No VODs yet.</p>"
     else:
@@ -275,13 +358,18 @@ def render_page(authed: bool = False):
                 day = v["date"]
                 rows.append(f'<div class="day">{day}</div>')
             f = html.escape(v["name"])
+            is_cloud = v.get("cloud", False)
             live = '<span class="live">● recording</span>' if v.get("recording") else ""
+            cloud_badge = ' <span title="stored in cloud" style="color:#8ab4f8;font-size:.8rem">☁</span>' if is_cloud else ""
+            # src for the player: cloud files go through the proxy route
+            player_src = f"/vods/cloud/{f}" if is_cloud else f"/vods/{f}"
             if gate and not authed:
-                dl = f'<button style="background:none;border:none;cursor:pointer;color:#8ab4f8;font-size:.9rem" onclick="openLogin(\'{f}\')">🔒 download</button>'
+                dl = f'<button style="background:none;border:none;cursor:pointer;color:#8ab4f8;font-size:.9rem" onclick="openLogin(\'{f}\',{str(is_cloud).lower()})">🔒 download</button>'
             else:
-                dl = f'<a href="/vods/download/{f}" download>download</a>'
+                dl_href = f"/vods/cloud/{f}?dl=1" if is_cloud else f"/vods/download/{f}"
+                dl = f'<a href="{dl_href}" download>download</a>'
             rows.append(
-                f'<div class="v" data-f="{f}"><span>▶ {v["start"]}{live}</span>'
+                f'<div class="v" data-f="{player_src}"><span>▶ {v["start"]}{live}{cloud_badge}</span>'
                 f'<span><small>{human(v["size"])}</small> &nbsp;{dl}</span></div>')
         rows = "\n".join(rows)
 
@@ -327,13 +415,21 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", ""):
             return self._send(302, extra={"Location": "/vods"})
         if path == "/vods/api/list":
-            return self._send(200, json.dumps(list_vods()).encode(), "application/json")
+            return self._send(200, json.dumps(merged_vods()).encode(), "application/json")
         # /vods/download/<name>  — gated download (triggers Content-Disposition)
         if path.startswith("/vods/download/"):
             if not _download_allowed(self):
                 return self._send(403, b"login required")
             name = urllib.parse.unquote(path[len("/vods/download/"):])
             return self.serve_file(name, download=True)
+        # /vods/cloud/<name>  — proxy to rclone WebDAV (cloud-only files)
+        if path.startswith("/vods/cloud/"):
+            name = urllib.parse.unquote(path[len("/vods/cloud/"):])
+            parsed = urllib.parse.urlparse(self.path)
+            force_dl = "dl" in urllib.parse.parse_qs(parsed.query)
+            if force_dl and not _download_allowed(self):
+                return self._send(403, b"login required")
+            return self.proxy_cloud(name, download=force_dl)
         # /vods/<name>  — streaming (always allowed; browser can play without auth)
         if path.startswith("/vods/"):
             return self.serve_file(urllib.parse.unquote(path[6:]))
@@ -423,6 +519,55 @@ class Handler(BaseHTTPRequestHandler):
                     left -= len(chunk)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+
+    def proxy_cloud(self, name, download=False):
+        """Proxy a cloud VOD from rclone WebDAV, with Range passthrough.
+        download=True adds Content-Disposition: attachment (saves the file).
+        Without it the browser can play the video inline in the page player.
+        """
+        if not FILE_RE.match(name):
+            return self._send(404, b"not found")
+        if not CLOUD_URL:
+            return self._send(503, b"cloud playback not configured")
+        url = f"{CLOUD_URL}/{urllib.parse.quote(name)}"
+        req_headers = {}
+        rng = self.headers.get("Range")
+        if rng:
+            req_headers["Range"] = rng
+        try:
+            req = urllib.request.Request(url, headers=req_headers)
+            upstream = urllib.request.urlopen(req, timeout=15)
+        except urllib.error.HTTPError as e:
+            return self._send(e.code, str(e).encode())
+        except Exception as e:
+            log("cloud proxy error:", e)
+            return self._send(502, b"cloud unavailable")
+        status = upstream.status
+        self.send_response(status)
+        for hdr in ("Content-Type", "Content-Length", "Content-Range",
+                    "Accept-Ranges"):
+            val = upstream.headers.get(hdr)
+            if val:
+                self.send_header(hdr, val)
+        if download:
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{name}"')
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command == "HEAD":
+            upstream.close()
+            return
+        try:
+            while True:
+                chunk = upstream.read(1 << 20)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            upstream.close()
 
 
 def main():

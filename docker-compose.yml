@@ -20,6 +20,9 @@ services:
     image: rclone/rclone:latest
     restart: unless-stopped
     profiles: [backup]
+    # Host networking lets the WebDAV server bind to 127.0.0.1:CLOUD_PORT so
+    # the vods container (also host-networked) can reach it for cloud playback.
+    network_mode: host
     env_file: .env
     entrypoint: ["/bin/sh", "/backup.sh"]
     volumes:

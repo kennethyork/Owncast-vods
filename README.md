@@ -332,6 +332,33 @@ docker compose logs -f backup
 You'll see `cloud backup: /vods -> dropbox:Owncast VODs every 15 min`. The
 first upload happens once the current chunk finishes.
 
+### 7c. Cloud playback on /vods (optional)
+
+VODs that have been deleted locally but still exist in the cloud can be listed
+and played directly from the `/vods` page. They appear with a ☁ icon and
+stream through the recorder (so the cloud remote never needs to be public).
+
+Add two lines to `.env`:
+
+```bash
+CLOUD_PORT=8091      # WebDAV port inside the backup container (local only)
+CLOUD_URL=http://127.0.0.1:8091
+```
+
+Then restart both containers:
+
+```bash
+docker compose up -d
+```
+
+The backup container automatically starts a local WebDAV server on
+`127.0.0.1:CLOUD_PORT`. The recorder calls it once a minute to get the cloud
+VOD list and proxies any playback request through itself — the cloud storage
+never needs to be publicly reachable.
+
+Downloads of cloud VODs are still gated by `ADMIN_PASSWORD` (the 🔒 button
+works for both local and cloud files).
+
 ---
 
 ## 8. Settings
@@ -354,6 +381,8 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `WEBHOOK_TOKEN` | – | Required `?token=` on the webhook URL |
 | `ADMIN_PASSWORD` | – | Password to download VODs (empty = no gate) |
 | `COMPOSE_PROFILES` | – | `backup` turns on cloud backup |
+| `CLOUD_PORT` | `8091` | WebDAV port inside the backup container |
+| `CLOUD_URL` | – | `http://127.0.0.1:8091` enables cloud playback on /vods |
 | `BACKUP_REMOTE` | `dropbox` | rclone remote name |
 | `BACKUP_FOLDER` | `Owncast VODs` | Folder (or bucket/folder) on the remote |
 | `BACKUP_INTERVAL_MIN` | `15` | Minutes between upload runs |
