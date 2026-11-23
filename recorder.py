@@ -13,20 +13,22 @@ import hashlib
 import hmac
 import html
 import json
-import smtplib
-import ssl
-import xml.etree.ElementTree as ET
 import os
 import re
 import secrets
 import shutil
 import signal
+import smtplib
+import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -50,6 +52,8 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # download gate; empty = 
 # WebDAV base URL served by the rclone backup container (cloud playback).
 # Empty string disables cloud listing entirely.
 CLOUD_URL = os.environ.get("CLOUD_URL", "").rstrip("/")  # e.g. http://127.0.0.1:8091
+# Comments under VODs, signed with the viewer's Owncast chat name.
+COMMENTS = os.environ.get("COMMENTS", "1") not in ("0", "false", "no", "")
 
 # ---- Thumbnails ----
 # Set to "" to disable thumbnail generation.
@@ -72,26 +76,46 @@ def _hash(pw: str) -> str:
     """SHA-256 hex of the password (compare tokens server-side, never raw PW)."""
     return hashlib.sha256(pw.encode()).hexdigest()
 
-# A random 32-byte secret minted per-process to sign session tokens.
-_SESSION_SECRET = secrets.token_hex(32)
+SESSION_SECONDS = 86400  # admin login lifetime
+PLAY_LINK_SECONDS = 12 * 3600  # signed playback links (must outlast a 4h VOD + pauses)
+
+
+def _load_secret() -> bytes:
+    """Random secret kept in VOD_DIR so sessions survive container restarts.
+    The admin password is mixed in, so changing it logs everyone out."""
+    path = VOD_DIR / ".secret"
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        raw = ""
+    if len(raw) < 64:
+        raw = secrets.token_hex(32)
+        try:
+            VOD_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw)
+            path.chmod(0o600)
+        except OSError as e:
+            log("could not save session secret (logins reset on restart):", e)
+    return hmac.new(raw.encode(), ADMIN_PASSWORD.encode(), "sha256").digest()
+
+
+def _sign(msg: str) -> str:
+    return hmac.new(_SECRET, msg.encode(), "sha256").hexdigest()
+
 
 def _make_token() -> str:
-    sig = hmac.new(_SESSION_SECRET.encode(), b"admin", "sha256").hexdigest()
-    return f"admin:{sig}"
+    exp = int(time.time()) + SESSION_SECONDS
+    return f"{exp}.{_sign(f'admin:{exp}')}"
+
 
 def _valid_token(tok: str) -> bool:
-    if not tok:
+    exp, _, sig = tok.partition(".")
+    if not (exp.isascii() and exp.isdigit()) or int(exp) < time.time():
         return False
-    try:
-        expected = _make_token()
-        return hmac.compare_digest(tok, expected)
-    except Exception:
-        return False
+    return hmac.compare_digest(sig.encode(), _sign(f"admin:{exp}").encode())
 
-def _download_allowed(handler) -> bool:
-    """Return True if the request carries a valid session cookie or no password is set."""
-    if not ADMIN_PASSWORD:
-        return True
+
+def _is_admin(handler) -> bool:
     cookies = handler.headers.get("Cookie", "")
     for part in cookies.split(";"):
         k, _, v = part.strip().partition("=")
@@ -100,8 +124,251 @@ def _download_allowed(handler) -> bool:
     return False
 
 
+def _download_allowed(handler) -> bool:
+    """Return True if the request carries a valid session cookie or no password is set."""
+    return not ADMIN_PASSWORD or _is_admin(handler)
+
+
+def _play_query(name: str) -> str:
+    """Query string that lets the page player stream `name` for a limited time.
+    Empty when there is no password (playback URLs are then plain and permanent)."""
+    if not ADMIN_PASSWORD:
+        return ""
+    exp = int(time.time()) + PLAY_LINK_SECONDS
+    return f"?exp={exp}&sig={_sign(f'play:{name}:{exp}')}"
+
+
+def _play_allowed(handler, name: str) -> bool:
+    """Streaming needs a signed link from the page (or an admin cookie) when a
+    password is set, so the raw /vods/<file>.mp4 URL isn't a permanent download."""
+    if _download_allowed(handler):
+        return True
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
+    exp, sig = q.get("exp", [""])[0], q.get("sig", [""])[0]
+    if not (exp.isascii() and exp.isdigit()) or int(exp) < time.time():
+        return False
+    return hmac.compare_digest(sig.encode(), _sign(f"play:{name}:{exp}").encode())
+
+
+# ---- Login rate limiting: LOGIN_MAX_FAILS wrong passwords per IP per window ----
+LOGIN_MAX_FAILS = 5
+LOGIN_WINDOW = 15 * 60
+_login_fails: dict = {}  # ip -> [timestamps of recent failures]
+_login_lock = threading.Lock()
+
+
+def _client_ip(handler) -> str:
+    """Real client IP. Behind a local reverse proxy every request comes from
+    127.0.0.1, so use the last X-Forwarded-For hop (the one the proxy added)."""
+    ip = handler.client_address[0]
+    fwd = handler.headers.get("X-Forwarded-For", "")
+    if fwd and ip in ("127.0.0.1", "::1"):
+        ip = fwd.split(",")[-1].strip() or ip
+    return ip
+
+
+def _login_blocked(ip: str) -> bool:
+    now = time.time()
+    with _login_lock:
+        recent = [t for t in _login_fails.get(ip, []) if now - t < LOGIN_WINDOW]
+        if recent:
+            _login_fails[ip] = recent
+        else:
+            _login_fails.pop(ip, None)
+        return len(recent) >= LOGIN_MAX_FAILS
+
+
+def _login_failed(ip: str):
+    with _login_lock:
+        _login_fails.setdefault(ip, []).append(time.time())
+
+
+# ---------------------------------------------------- VOD comments ----------
+# /vods is on the Owncast domain, so the browser sends Owncast's
+# owncast_chat_token cookie (v0.3.0+; older versions: localStorage, sent by the
+# page as X-Chat-Token). Owncast has no "who am I" API: the only check is
+# opening the chat websocket and reading CONNECTED_USER_INFO. While live that
+# counts as joining chat ("X joined" + webhook), so tokens are only checked,
+# and comments only posted, while the stream is offline.
+COMMENT_MAX_LEN = 500
+COMMENT_MAX_PER_VOD = 1000
+COMMENT_MIN_GAP = 10  # seconds between comments from one chat user
+IDENTITY_TTL = 3600  # reuse a verified token this long (limits "user parted" webhooks)
+VERIFY_MAX = 10  # websocket checks per IP per VERIFY_WINDOW
+VERIFY_WINDOW = 600
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-+/=.]{8,256}$")
+_identities: dict = {}  # sha256(token) -> (expires, status, user)
+_verify_hits: dict = {}  # ip -> [timestamps of websocket checks]
+_ident_lock = threading.Lock()
+_comment_lock = threading.Lock()
+_last_comment: dict = {}  # chat user id -> time of last comment
+
+
+class CommentError(Exception):
+    def __init__(self, code: int, err: str):
+        super().__init__(err)
+        self.code, self.err = code, err
+
+
+class ChatAuthError(Exception):
+    pass
+
+
+def _ws_read_frame(f):
+    hdr = f.read(2)
+    if len(hdr) < 2:
+        raise ChatAuthError("chat closed the connection")
+    n = hdr[1] & 0x7F
+    if n == 126:
+        n = int.from_bytes(f.read(2), "big")
+    elif n == 127:
+        n = int.from_bytes(f.read(8), "big")
+    if n > 1 << 20:
+        raise ChatAuthError("chat frame too large")
+    mask = f.read(4) if hdr[1] & 0x80 else b""
+    data = f.read(n)
+    if mask:
+        data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    return hdr[0] & 0x80, hdr[0] & 0x0F, data
+
+
+def owncast_whoami(token: str):
+    """Ask Owncast chat who owns `token`: ("ok", user) / ("invalid", None) /
+    ("banned", None). Raises ChatAuthError if chat can't be asked."""
+    u = urllib.parse.urlsplit(OWNCAST_URL)
+    tls = u.scheme == "https"
+    path = u.path.rstrip("/") + "/ws?accessToken=" + urllib.parse.quote(token, safe="")
+    try:
+        sock = socket.create_connection((u.hostname, u.port or (443 if tls else 80)), timeout=8)
+    except OSError as e:
+        raise ChatAuthError(f"cannot reach Owncast: {e}")
+    try:
+        if tls:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {u.netloc}\r\n"
+                      "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                      f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+                      "User-Agent: owncast-vods\r\n\r\n").encode())
+        f = sock.makefile("rb")
+        status = f.readline().decode("latin-1").strip()
+        while f.readline() not in (b"\r\n", b"\n", b""):
+            pass
+        if " 101 " not in status + " ":
+            raise ChatAuthError(f"chat refused the connection ({status[:60]}) - is chat disabled?")
+        buf = b""
+        for _ in range(20):
+            fin, op, data = _ws_read_frame(f)
+            if op == 8:  # close
+                break
+            if op not in (0, 1):  # ping/pong/binary
+                continue
+            buf += data
+            if not fin:
+                continue
+            # Owncast batches several JSON messages per frame, one per line.
+            for line in buf.splitlines():
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                t = msg.get("type") if isinstance(msg, dict) else None
+                if t == "CONNECTED_USER_INFO" and isinstance(msg.get("user"), dict):
+                    return "ok", msg["user"]
+                if t == "ERROR_NEEDS_REGISTRATION":
+                    return "invalid", None
+                if t == "ERROR_USER_DISABLED":
+                    return "banned", None
+            buf = b""
+        raise ChatAuthError("chat sent no user info")
+    except OSError as e:
+        raise ChatAuthError(f"chat connection failed: {e}")
+    finally:
+        try:
+            m = os.urandom(4)
+            sock.sendall(b"\x88\x82" + m + bytes(b ^ m[i] for i, b in enumerate(b"\x03\xe8")))
+        except OSError:
+            pass
+        sock.close()
+
+
+def _cached_identity(token: str):
+    """(status, user) if this token was checked recently, else None. No side effects."""
+    hit = _identities.get(hashlib.sha256(token.encode()).hexdigest())
+    if hit and hit[0] > time.time():
+        return hit[1], hit[2]
+    return None
+
+
+def identify(token: str, ip: str) -> dict:
+    """Owncast chat user for `token`, or CommentError. Only opens the chat
+    websocket while offline (see above)."""
+    with _ident_lock:
+        hit = _cached_identity(token)
+    if hit:
+        status, user = hit
+    else:
+        if rec.stream_online():
+            raise CommentError(409, "live")
+        now = time.time()
+        with _ident_lock:
+            recent = [t for t in _verify_hits.get(ip, []) if now - t < VERIFY_WINDOW]
+            if len(recent) >= VERIFY_MAX:
+                _verify_hits[ip] = recent
+                raise CommentError(429, "rate_limited")
+            _verify_hits[ip] = recent + [now]
+        try:
+            status, user = owncast_whoami(token)
+        except ChatAuthError as e:
+            log("chat token check failed:", e)
+            raise CommentError(502, "chat_unreachable")
+        with _ident_lock:
+            for k in [k for k, v in _identities.items() if v[0] <= now]:
+                del _identities[k]
+            ttl = IDENTITY_TTL if status == "ok" else 60
+            _identities[hashlib.sha256(token.encode()).hexdigest()] = (now + ttl, status, user)
+    if status == "invalid":
+        raise CommentError(401, "no_chat")
+    if status == "banned":
+        raise CommentError(403, "banned")
+    return user
+
+
+def _is_mod(user: dict) -> bool:
+    return "MODERATOR" in (user.get("scopes") or [])
+
+
+def _public_user(user: dict) -> dict:
+    return {"id": user.get("id"), "name": user.get("displayName"), "mod": _is_mod(user)}
+
+
+def comments_path(vod_name: str) -> Path:
+    return VOD_DIR / (vod_name[:-4] + ".comments.json")  # vod_*.mp4 → vod_*.comments.json
+
+
+def load_comments(vod_name: str) -> list:
+    try:
+        items = json.loads(comments_path(vod_name).read_text())
+        return items if isinstance(items, list) else []
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        log("could not read comments for", vod_name, e)
+        return []
+
+
+def save_comments(vod_name: str, items: list):
+    path = comments_path(vod_name)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(items))
+    tmp.replace(path)
+
+
 def log(*a):
     print(time.strftime("[%Y-%m-%d %H:%M:%S]"), *a, flush=True)
+
+
+_SECRET = _load_secret()
 
 
 # -------------------------------------------------------------- recorder ----
@@ -110,6 +377,7 @@ class Recorder:
         self.proc = None
         self.lock = threading.Lock()
         self.wake = threading.Event()
+        self.online = False  # last polled stream status
 
     @property
     def running(self):
@@ -163,28 +431,67 @@ class Recorder:
             self.proc = None
 
     def loop(self):
-        # Track which VODs we've already processed (thumbnail + email).
-        seen: set = set()
+        # VODs already announced by email, saved to disk so a restart doesn't
+        # re-send one email per VOD. First run: everything on disk counts as seen.
+        seen = load_seen()
+        if seen is None:
+            seen = {v["name"] for v in list_vods()}
+            save_seen(seen)
+        thumb_tried: set = set()
         while True:
-            online = self.stream_online()
+            online = self.online = self.stream_online()
             if online and not self.running:
                 self.start()
             elif not online and self.running:
                 self.stop()
             cleanup()
             # Detect newly finished VODs (not currently recording).
-            for v in list_vods():
+            vods = list_vods()
+            changed = False
+            for v in vods:
                 name = v["name"]
-                if name in seen or v.get("recording"):
+                if v.get("recording"):
                     continue
-                seen.add(name)
-                make_thumb_bg(name)
-                notify_bg(v)
+                if not v["thumb"] and name not in thumb_tried:
+                    thumb_tried.add(name)
+                    make_thumb_bg(name)
+                if name not in seen:
+                    seen.add(name)
+                    changed = True
+                    notify_bg(v)
+            # Forget deleted VODs so the file doesn't grow forever.
+            on_disk = {v["name"] for v in vods}
+            if changed or not seen <= on_disk:
+                seen &= on_disk
+                save_seen(seen)
             self.wake.wait(POLL_SECONDS)
             self.wake.clear()
 
 
 rec = Recorder()
+
+SEEN_FILE = VOD_DIR / ".notified.json"
+
+
+def load_seen():
+    """Set of VOD names already notified, or None if never saved."""
+    try:
+        return set(json.loads(SEEN_FILE.read_text()))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        log("could not read", SEEN_FILE.name, "- treating all VODs as seen:", e)
+        return None
+
+
+def save_seen(seen: set):
+    tmp = SEEN_FILE.with_suffix(".tmp")
+    try:
+        VOD_DIR.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(sorted(seen)))
+        tmp.replace(SEEN_FILE)
+    except OSError as e:
+        log("could not save", SEEN_FILE.name, e)
 
 
 # --------------------------------------------------------------- storage ----
@@ -230,13 +537,15 @@ def _delete(v, why):
         log("deleted", v["name"], f"({why})")
     except OSError as e:
         log("delete failed", v["name"], e)
-    # Remove the matching thumbnail too
-    jpg = thumb_path(v["name"])
-    if jpg.exists():
-        try:
-            jpg.unlink()
-        except OSError:
-            pass
+    # Remove the matching thumbnail too. Comments stay while the VOD can still
+    # be watched from the cloud copy.
+    extras = [thumb_path(v["name"])] + ([] if CLOUD_URL else [comments_path(v["name"])])
+    for p in extras:
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 def human(n):
@@ -355,8 +664,6 @@ def notify_bg(vod: dict):
 
 
 # ---------------------------------------------------------- cloud listing ----
-import xml.etree.ElementTree as ET
-
 _cloud_cache: list = []
 _cloud_cache_time: float = 0.0
 _CLOUD_TTL = 60  # seconds between WebDAV PROPFIND calls
@@ -364,8 +671,12 @@ _CLOUD_TTL = 60  # seconds between WebDAV PROPFIND calls
 _DAV_NS = "DAV:"
 
 
+THUMB_RE = re.compile(r"^vod_\d{4}-\d{2}-\d{2}_\d{6}\.jpg$")
+
+
 def _propfind(url: str) -> list:
-    """Return list of dicts {name, size} from a WebDAV PROPFIND response."""
+    """Return list of dicts {name, size} (VODs and thumbnails) from a WebDAV
+    PROPFIND response."""
     req = urllib.request.Request(
         url + "/",
         method="PROPFIND",
@@ -379,8 +690,8 @@ def _propfind(url: str) -> list:
     out = []
     for resp in root.iter(f"{{{_DAV_NS}}}response"):
         href = (resp.findtext(f"{{{_DAV_NS}}}href") or "").rstrip("/")
-        name = href.rsplit("/", 1)[-1]
-        if not FILE_RE.match(name):
+        name = urllib.parse.unquote(href.rsplit("/", 1)[-1])
+        if not (FILE_RE.match(name) or THUMB_RE.match(name)):
             continue
         cl = resp.findtext(
             f"{{{_DAV_NS}}}propstat/{{{_DAV_NS}}}prop/{{{_DAV_NS}}}getcontentlength"
@@ -400,10 +711,11 @@ def list_cloud_vods() -> list:
     try:
         remote = _propfind(CLOUD_URL)
         local_names = {v["name"] for v in list_vods()}
+        remote_names = {f["name"] for f in remote}
         result = []
         for f in remote:
-            if f["name"] not in local_names:
-                m = FILE_RE.match(f["name"])
+            m = FILE_RE.match(f["name"])
+            if m and f["name"] not in local_names:
                 result.append({
                     "name": f["name"],
                     "date": m.group(1),
@@ -411,6 +723,7 @@ def list_cloud_vods() -> list:
                     "size": f["size"],
                     "mtime": 0.0,
                     "cloud": True,
+                    "thumb": f["name"][:-4] + ".jpg" in remote_names,
                 })
         result.sort(key=lambda v: v["name"], reverse=True)
         _cloud_cache = result
@@ -428,6 +741,12 @@ def merged_vods() -> list:
     combined = local + cloud
     combined.sort(key=lambda v: v["name"], reverse=True)
     return combined
+
+
+def vod_exists(name: str) -> bool:
+    if not FILE_RE.match(name):
+        return False
+    return (VOD_DIR / name).is_file() or any(v["name"] == name for v in list_cloud_vods())
 
 
 # ------------------------------------------------------------------ http ----
@@ -457,9 +776,22 @@ a{{color:#8ab4f8}} small{{color:#888}}
 #mbox input{{width:100%;padding:8px;border:1px solid #444;border-radius:6px;background:#111;color:#eee;font-size:1rem;box-sizing:border-box}}
 #mbox button{{margin-top:12px;width:100%;padding:9px;background:#8ab4f8;color:#000;border:0;border-radius:6px;font-size:1rem;cursor:pointer;font-weight:600}}
 #merr{{color:#f55;font-size:.85rem;margin-top:8px;min-height:1em}}
+/* comments */
+#cbox{{display:none;margin:0 0 16px;padding:12px;background:#181818;border-radius:8px}}
+#cbox h2{{margin:0 0 8px;font-size:1rem}}
+.c{{padding:6px 0;border-bottom:1px solid #222}}
+.cn{{font-weight:600;margin-right:6px}}
+.ct,.cpos{{color:#888;font-size:.8rem;margin-right:6px}}
+.cpos{{cursor:pointer;color:#8ab4f8}}
+.cdel{{background:none;border:0;color:#888;cursor:pointer;font-size:.8rem;float:right}}
+.cx{{white-space:pre-wrap;word-wrap:break-word;margin-top:2px}}
+#ctext{{width:100%;box-sizing:border-box;min-height:60px;margin-top:10px;padding:8px;background:#111;color:#eee;border:1px solid #444;border-radius:6px;font:inherit}}
+#cpost{{margin-top:6px;padding:7px 16px;background:#8ab4f8;color:#000;border:0;border-radius:6px;font-weight:600;cursor:pointer}}
+#cmsg{{color:#aaa;font-size:.85rem;margin-top:6px}}
 </style></head><body>
 <h1>{title}</h1><p><a href="{live}">← back to live</a></p>
 <video id="p" controls playsinline></video>
+{comments_box}
 {rows}
 {login_modal}
 <script>
@@ -469,9 +801,61 @@ document.querySelectorAll('.v').forEach(r=>r.onclick=e=>{{
   p.style.display='block';
   if(th)p.poster=th; else p.removeAttribute('poster');
   p.src=src;p.play();scrollTo(0,0);
+  if(window.loadComments)loadComments(r.dataset.n);
 }});
 {login_js}
+{comments_js}
 </script></body></html>"""
+
+COMMENTS_BOX = """<div id="cbox"><h2>Comments</h2><div id="clist"></div>
+<div id="cform"><textarea id="ctext" maxlength="500" placeholder="Add a comment as your chat name…"></textarea>
+<button id="cpost">Post</button></div><div id="cmsg"></div></div>"""
+
+COMMENTS_JS = """
+var _vod=null,_me=null,_admin=false;
+var CERR={no_chat:'To comment, open the chat on the live page once so Owncast gives you a chat name, then come back.',
+  banned:'You are banned from chat, so you can\\'t comment.',
+  live:'Comments are closed while the stream is live. They reopen when it ends.',
+  slow_down:'Slow down a little.',rate_limited:'Too many attempts. Try again later.',
+  length:'Comments must be 1-500 characters.',full:'This VOD has reached its comment limit.',
+  chat_unreachable:'Couldn\\'t reach chat to check your name. Try again later.'};
+function chatToken(){try{var t=localStorage.getItem('accessToken')||'';
+  try{var j=JSON.parse(t);if(typeof j==='string')t=j;}catch(e){}
+  return /^[A-Za-z0-9_+\\/=.-]+$/.test(t)?t:'';}catch(e){return '';}}
+function capi(url,body){var o={headers:{'X-Chat-Token':chatToken()},credentials:'same-origin'};
+  if(body){o.method='POST';o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
+  return fetch(url,o).then(r=>r.json().then(d=>({status:r.status,d:d})));}
+function fmt(s){s=Math.floor(s);var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0');}
+function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
+function cmsg(t){document.getElementById('cmsg').textContent=t||'';}
+function loadComments(name){_vod=name;document.getElementById('cbox').style.display='block';cmsg('');
+  document.getElementById('clist').textContent='Loading…';
+  capi('/vods/api/comments?vod='+encodeURIComponent(name)).then(function(res){
+    if(name!==_vod)return;var d=res.d;_me=d.me||_me;_admin=!!d.admin;
+    document.getElementById('cform').style.display=d.open?'':'none';
+    if(!d.open)cmsg(CERR.live);
+    var list=document.getElementById('clist');list.textContent='';
+    if(!d.comments||!d.comments.length)list.appendChild(el('div','ct','No comments yet.'));
+    (d.comments||[]).forEach(function(c){
+      var row=el('div','c'),n=el('span','cn',c.name);
+      n.style.color='hsl('+((c.color||0)*47%360)+',70%,70%)';row.appendChild(n);
+      row.appendChild(el('span','ct',new Date(c.t*1000).toLocaleString()));
+      if(c.pos!=null){var a=el('span','cpos','@'+fmt(c.pos));
+        a.onclick=function(){var p=document.getElementById('p');p.currentTime=c.pos;p.play();scrollTo(0,0);};row.appendChild(a);}
+      if(_admin||(_me&&(_me.mod||_me.id===c.uid))){var b=el('button','cdel','delete');
+        b.onclick=function(){if(confirm('Delete this comment?'))capi('/vods/api/comments/delete',{vod:_vod,id:c.id})
+          .then(function(r){if(r.d.ok)loadComments(_vod);else cmsg(CERR[r.d.error]||'Could not delete.');});};row.appendChild(b);}
+      row.appendChild(el('div','cx',c.text));list.appendChild(row);});
+  }).catch(function(){document.getElementById('clist').textContent='Could not load comments.';});}
+document.getElementById('cpost').onclick=function(){
+  var t=document.getElementById('ctext'),p=document.getElementById('p'),btn=this;
+  if(!t.value.trim())return;btn.disabled=true;cmsg('Posting…');
+  capi('/vods/api/comments',{vod:_vod,text:t.value,pos:p.currentTime||null}).then(function(r){
+    btn.disabled=false;
+    if(r.d.ok){t.value='';_me=r.d.me;loadComments(_vod);}
+    else cmsg(CERR[r.d.error]||'Could not post.');
+  }).catch(function(){btn.disabled=false;cmsg('Could not post.');});};"""
 
 LOGIN_MODAL = """<div id="modal"><div id="mbox">
 <h2>Admin login to download</h2>
@@ -490,14 +874,15 @@ document.getElementById('mpw').addEventListener('keydown',e=>{if(e.key==='Enter'
 function doLogin(){
   var pw=document.getElementById('mpw').value;
   fetch('/vods/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})})
-  .then(r=>r.json()).then(d=>{
-    if(d.ok){document.getElementById('modal').classList.remove('open');
+  .then(r=>r.json().then(d=>{
+    if(r.status===429){document.getElementById('merr').textContent='Too many attempts. Try again later.';}
+    else if(d.ok){document.getElementById('modal').classList.remove('open');
               document.getElementById('mpw').value='';
               if(_dlFile){var a=document.createElement('a');
                 a.href=_dlCloud?'/vods/cloud/'+_dlFile+'?dl=1':'/vods/download/'+_dlFile;
                 a.download=_dlFile;a.click();}
     }else{document.getElementById('merr').textContent='Wrong password.';}
-  });
+  }));
 }"""
 
 OPEN_DOWNLOAD_JS = ""  # no modal needed when downloads are open
@@ -532,8 +917,9 @@ def render_page(authed: bool = False):
             live_badge = '<span class="live">● recording</span>' if v.get("recording") else ""
             cloud_badge = '<span class="cloud">☁ cloud</span>' if is_cloud else ""
 
-            # Player src
-            player_src = f"/vods/cloud/{f}" if is_cloud else f"/vods/{f}"
+            # Player src (signed + expiring when a password is set)
+            play = ("" if authed else _play_query(v["name"])).replace("&", "&amp;")
+            player_src = (f"/vods/cloud/{f}" if is_cloud else f"/vods/{f}") + play
 
             # Download link/button
             if gate and not authed:
@@ -545,7 +931,7 @@ def render_page(authed: bool = False):
                 dl = f'<a href="{dl_href}" download>download</a>'
 
             rows.append(
-                f'<div class="v" data-f="{player_src}"{data_th}>'
+                f'<div class="v" data-f="{player_src}" data-n="{f}"{data_th}>'
                 f'{thumb_html}'
                 f'<div class="vinfo">'
                 f'<div class="vtitle">▶ {v["date"]} {v["start"]}{" " if live_badge or cloud_badge else ""}{live_badge}{cloud_badge}</div>'
@@ -569,6 +955,8 @@ def render_page(authed: bool = False):
         rows=rows,
         login_modal=modal,
         login_js=js,
+        comments_box=COMMENTS_BOX if COMMENTS else "",
+        comments_js=COMMENTS_JS if COMMENTS else "",
     ).encode()
 
 
@@ -594,11 +982,25 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/vods", "/vods/"):
             authed = _download_allowed(self)
-            return self._send(200, render_page(authed), "text/html; charset=utf-8")
+            # no-store: the page holds expiring playback links
+            return self._send(200, render_page(authed), "text/html; charset=utf-8",
+                              extra={"Cache-Control": "no-store"})
         if path in ("/", ""):
             return self._send(302, extra={"Location": "/vods"})
         if path == "/vods/api/list":
             return self._send(200, json.dumps(merged_vods()).encode(), "application/json")
+        if path == "/vods/api/comments" and COMMENTS:
+            name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("vod", [""])[0]
+            if not vod_exists(name):
+                return self._json(404, {"error": "not_found"})
+            # Who's viewing, from the cache only: never opens a chat connection.
+            token = self._chat_token()
+            with _ident_lock:
+                hit = _cached_identity(token) if token else None
+            me = _public_user(hit[1]) if hit and hit[0] == "ok" else None
+            return self._json(200, {"comments": load_comments(name), "open": not rec.online,
+                                    "me": me, "admin": _is_admin(self)},
+                              extra={"Cache-Control": "no-store"})
         # /vods/download/<name>  — gated download (triggers Content-Disposition)
         if path.startswith("/vods/download/"):
             if not _download_allowed(self):
@@ -612,13 +1014,18 @@ class Handler(BaseHTTPRequestHandler):
             force_dl = "dl" in urllib.parse.parse_qs(parsed.query)
             if force_dl and not _download_allowed(self):
                 return self._send(403, b"login required")
+            if not _play_allowed(self, name):
+                return self._send(403, b"link expired - reload the VOD page")
             return self.proxy_cloud(name, download=force_dl)
         # /vods/thumb/<name>.jpg  — VOD thumbnail (public)
         if path.startswith("/vods/thumb/"):
             return self.serve_thumb(urllib.parse.unquote(path[len("/vods/thumb/"):]))
-        # /vods/<name>  — streaming (always allowed; browser can play without auth)
+        # /vods/<name>  — streaming (needs a signed link from the page if a password is set)
         if path.startswith("/vods/"):
-            return self.serve_file(urllib.parse.unquote(path[6:]))
+            name = urllib.parse.unquote(path[6:])
+            if not _play_allowed(self, name):
+                return self._send(403, b"link expired - reload the VOD page")
+            return self.serve_file(name)
         self._send(404, b"not found")
 
     def do_POST(self):
@@ -627,10 +1034,15 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/vods/login":
             n = int(self.headers.get("Content-Length") or 0)
             try:
-                body = json.loads(self.rfile.read(n) or b"{}")
-                pw = body.get("password", "")
+                body = json.loads(self.rfile.read(min(n, 4096)) or b"{}")
+                pw = str(body.get("password", ""))
             except (ValueError, AttributeError):
                 pw = ""
+            ip = _client_ip(self)
+            if _login_blocked(ip):
+                log("login blocked (too many attempts) from", ip)
+                return self._send(429, json.dumps({"ok": False}).encode(), "application/json",
+                                  extra={"Retry-After": str(LOGIN_WINDOW)})
             if ADMIN_PASSWORD and hmac.compare_digest(_hash(pw), _hash(ADMIN_PASSWORD)):
                 token = _make_token()
                 resp = json.dumps({"ok": True}).encode()
@@ -640,16 +1052,28 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(resp)))
                 self.send_header("Set-Cookie",
-                    f"vod_admin={token}; Path=/vods; HttpOnly; SameSite=Strict; Max-Age=86400")
+                    f"vod_admin={token}; Path=/vods; HttpOnly; SameSite=Strict; "
+                    f"Max-Age={SESSION_SECONDS}")
                 self.end_headers()
                 self.wfile.write(resp)
             else:
+                _login_failed(ip)
+                log("failed login from", ip)
+                time.sleep(1)  # slow down guessing even below the limit
                 self._send(401, json.dumps({"ok": False}).encode(), "application/json")
             return
+        if u.path in ("/vods/api/comments", "/vods/api/comments/delete") and COMMENTS:
+            try:
+                if u.path.endswith("/delete"):
+                    return self.delete_comment()
+                return self.post_comment()
+            except CommentError as e:
+                return self._json(e.code, {"ok": False, "error": e.err})
         # ---- Owncast webhook: STREAM_STARTED / STREAM_STOPPED ----
         if u.path not in ("/webhook", "/vods/webhook"):
             return self._send(404, b"not found")
-        if WEBHOOK_TOKEN and urllib.parse.parse_qs(u.query).get("token", [""])[0] != WEBHOOK_TOKEN:
+        token = urllib.parse.parse_qs(u.query).get("token", [""])[0]
+        if WEBHOOK_TOKEN and not hmac.compare_digest(token.encode(), WEBHOOK_TOKEN.encode()):
             return self._send(403, b"bad token")
         n = int(self.headers.get("Content-Length") or 0)
         try:
@@ -660,6 +1084,89 @@ class Handler(BaseHTTPRequestHandler):
         if event in ("STREAM_STARTED", "STREAM_STOPPED"):
             rec.wake.set()  # re-check status now instead of waiting for poll
         self._send(200, b"ok")
+
+    def _json(self, code, obj, extra=None):
+        self._send(code, json.dumps(obj).encode(), "application/json", extra)
+
+    def _json_body(self) -> dict:
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(min(n, 16384)) or b"{}")
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    def _chat_token(self) -> str:
+        """Owncast chat token: its cookie (v0.3.0+), else the page's X-Chat-Token
+        header (copied from localStorage on older Owncast)."""
+        tok = self.headers.get("X-Chat-Token", "").strip()
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "owncast_chat_token" and v.strip():
+                tok = v.strip().strip('"')
+                break
+        return tok if TOKEN_RE.match(tok) else ""
+
+    def post_comment(self):
+        body = self._json_body()
+        name = str(body.get("vod", ""))
+        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", str(body.get("text", ""))).strip()
+        if not vod_exists(name):
+            raise CommentError(404, "not_found")
+        if not text or len(text) > COMMENT_MAX_LEN:
+            raise CommentError(400, "length")
+        if rec.stream_online():  # fresh check, not the last poll
+            raise CommentError(409, "live")
+        token = self._chat_token()
+        if not token:
+            raise CommentError(401, "no_chat")
+        user = identify(token, _client_ip(self))
+        pos = body.get("pos")
+        pos = round(pos, 1) if isinstance(pos, (int, float)) and 0 <= pos < 1e6 else None
+        with _comment_lock:
+            now = time.time()
+            if now - _last_comment.get(user.get("id"), 0) < COMMENT_MIN_GAP:
+                raise CommentError(429, "slow_down")
+            items = load_comments(name)
+            if len(items) >= COMMENT_MAX_PER_VOD:
+                raise CommentError(409, "full")
+            c = {"id": secrets.token_hex(6), "uid": user.get("id"),
+                 "name": str(user.get("displayName") or "?")[:60],
+                 "color": user.get("displayColor") if isinstance(user.get("displayColor"), int) else 0,
+                 "text": text, "t": int(now), "pos": pos}
+            items.append(c)
+            try:
+                save_comments(name, items)
+            except OSError as e:
+                log("could not save comment for", name, e)
+                raise CommentError(500, "save_failed")
+            _last_comment[user.get("id")] = now
+        log("comment on", name, "by", c["name"])
+        self._json(200, {"ok": True, "comment": c, "me": _public_user(user)})
+
+    def delete_comment(self):
+        """Admin, Owncast moderators, and the comment's author may delete it."""
+        body = self._json_body()
+        name, cid = str(body.get("vod", "")), str(body.get("id", ""))
+        if not FILE_RE.match(name):
+            raise CommentError(404, "not_found")
+        user = None
+        if not _is_admin(self):
+            token = self._chat_token()
+            if not token:
+                raise CommentError(401, "no_chat")
+            user = identify(token, _client_ip(self))
+        with _comment_lock:
+            items = load_comments(name)
+            c = next((c for c in items if c.get("id") == cid), None)
+            if c is None:
+                raise CommentError(404, "not_found")
+            if user is not None and not _is_mod(user) and c.get("uid") != user.get("id"):
+                raise CommentError(403, "forbidden")
+            items.remove(c)
+            save_comments(name, items)
+        log("comment deleted on", name, "by", user.get("displayName") if user else "admin")
+        self._json(200, {"ok": True})
 
     def serve_file(self, name, download=False):
         if not FILE_RE.match(name):
@@ -712,10 +1219,13 @@ class Handler(BaseHTTPRequestHandler):
         # Accept either vod_*.jpg directly or vod_*.mp4 (derive jpg name)
         if name.endswith(".mp4"):
             name = name[:-4] + ".jpg"
-        if not re.match(r"^vod_\d{4}-\d{2}-\d{2}_\d{6}\.jpg$", name):
+        if not THUMB_RE.match(name):
             return self._send(404, b"not found")
         p = VOD_DIR / name
         if not p.is_file():
+            # VOD deleted locally? The backup also uploads thumbnails.
+            if CLOUD_URL:
+                return self._proxy(name, cache="public, max-age=86400")
             return self._send(404, b"not found")
         data = p.read_bytes()
         self._send(200, data, "image/jpeg",
@@ -728,6 +1238,10 @@ class Handler(BaseHTTPRequestHandler):
         """
         if not FILE_RE.match(name):
             return self._send(404, b"not found")
+        return self._proxy(name, download=download)
+
+    def _proxy(self, name, download=False, cache=None):
+        """Stream an already-validated file name from the rclone WebDAV server."""
         if not CLOUD_URL:
             return self._send(503, b"cloud playback not configured")
         url = f"{CLOUD_URL}/{urllib.parse.quote(name)}"
@@ -753,6 +1267,8 @@ class Handler(BaseHTTPRequestHandler):
         if download:
             self.send_header("Content-Disposition",
                              f'attachment; filename="{name}"')
+        if cache:
+            self.send_header("Cache-Control", cache)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if self.command == "HEAD":
@@ -772,6 +1288,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     log(f"owncast-vod: {OWNCAST_URL}, chunks={SEGMENT_SECONDS}s, dir={VOD_DIR}, port={PORT}")
+    if WEBHOOK_TOKEN.startswith("change-me") or ADMIN_PASSWORD.startswith("change-me"):
+        log("WARNING: WEBHOOK_TOKEN / ADMIN_PASSWORD still use the example value - change them in .env")
+    if SMTP_HOST and not NOTIFY_URL.startswith(("http://", "https://")):
+        log("WARNING: NOTIFY_URL should be a full URL (https://...) or email links won't work")
     threading.Thread(target=rec.loop, daemon=True).start()
 
     def shutdown(*_):

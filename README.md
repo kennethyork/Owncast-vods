@@ -18,6 +18,8 @@ Made for 24/7 streams, but it works for regular streams too.
   within 15 seconds.
 - **VOD page.** Grouped by day, with a built-in player, seeking, downloads and a
   JSON API. Add it to Owncast as a button for viewers.
+- **Comments with chat names.** Viewers comment under VODs as their Owncast
+  chat name, no extra account needed. Owncast moderators can delete comments.
 - **Manages disk space.** Deletes old VODs after N days, or sooner when the
   disk runs low.
 - **Cloud backup.** Optional: copies every finished VOD to the cloud.
@@ -383,6 +385,7 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `COMPOSE_PROFILES` | – | `backup` turns on cloud backup |
 | `CLOUD_PORT` | `8091` | WebDAV port inside the backup container |
 | `CLOUD_URL` | – | `http://127.0.0.1:8091` enables cloud playback on /vods |
+| `COMMENTS` | `1` | `0` turns off VOD comments |
 | `THUMB_ENABLED` | `1` | `0` disables thumbnail generation |
 | `THUMB_OFFSET` | `60` | Seconds into the VOD to grab the thumbnail frame |
 | `SMTP_HOST` | – | SMTP server for email notifications (empty = off) |
@@ -397,10 +400,37 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `BACKUP_INTERVAL_MIN` | `15` | Minutes between upload runs |
 | `BACKUP_RETENTION_DAYS` | `0` | Delete from the remote after N days (`0` = never) |
 
-**Endpoints:** `/vods` (page), `/vods/<file>.mp4` (video stream, no auth),
+**Endpoints:** `/vods` (page), `/vods/<file>.mp4` (video stream; needs the
+page's signed link when `ADMIN_PASSWORD` is set),
 `/vods/download/<file>.mp4` (download, gated by `ADMIN_PASSWORD`),
 `/vods/login` (POST, sets session cookie), `/vods/api/list` (JSON),
-`/vods/webhook` (Owncast webhook).
+`/vods/api/comments?vod=<file>.mp4` (comments, JSON; POST to add,
+POST `/vods/api/comments/delete` to remove), `/vods/webhook` (Owncast webhook).
+
+### Comments
+
+Viewers can comment under each VOD, signed with their **Owncast chat name**.
+There's nothing to sign up for: the page reuses the chat identity the browser
+already has from your Owncast page. That only works when `/vods` is served on
+the **same domain** as Owncast (the setups in section 5). A separate subdomain
+won't see the chat identity.
+
+- **Posting is only open while the stream is offline.** Owncast has no API to
+  look up a chat user, so the recorder checks a viewer's name by briefly
+  connecting to chat. While live, that would post "X joined the chat" and fire
+  a join webhook, so comments close during streams and reopen when they end.
+- Someone who has never opened chat has no chat name yet. The page tells them
+  to open chat on the live page once.
+- Each check is remembered for an hour. When the check disconnects, Owncast
+  still sends a **user parted** webhook (and shows "X left the chat" if
+  join/part messages are on), so expect at most one per commenter per hour.
+- Users banned in Owncast can't comment. Owncast moderators, the admin (logged
+  in with `ADMIN_PASSWORD`) and each comment's author can delete it.
+- Comments can be clicked to jump to the moment in the video they were posted
+  at. They're limited to 500 characters, one every 10 seconds per user.
+- Stored next to each VOD as `vod_*.comments.json`, and deleted with the VOD
+  unless cloud playback (`CLOUD_URL`) is on, in which case they stay for the
+  cloud copy.
 
 ### Admin downloads
 
@@ -413,8 +443,16 @@ ADMIN_PASSWORD=supersecretpassword
 
 After setting it, the download link on `/vods` becomes a 🔒 button.
 Click it → enter the password → the browser downloads the file.
-The session lasts 24 hours (one cookie, no database needed).
+The session lasts 24 hours and survives container restarts (the signing key
+is kept in `VOD_PATH/.secret`). Changing the password logs everyone out.
+After 5 wrong passwords from one IP, logins from that IP are blocked for
+15 minutes.
 Leave `ADMIN_PASSWORD` empty to allow anyone to download.
+
+With a password set, the page's player uses signed links that expire after
+12 hours, so the bare `/vods/<file>.mp4` URL can't be shared or scraped as a
+permanent download. This is a deterrent, not DRM: anyone who can watch a
+video in their browser can still save it with the browser's developer tools.
 
 Generate a strong password:
 ```bash
@@ -433,7 +471,8 @@ THUMB_OFFSET=60    # grab the frame at this many seconds into the VOD
 ```
 
 Thumbnails are stored alongside the VOD file (`.jpg` with the same name) and
-are removed automatically when the VOD is deleted.
+are removed automatically when the VOD is deleted. Cloud backup uploads them
+too, so cloud-only VODs keep their thumbnail.
 
 ### Email notifications
 
@@ -446,7 +485,12 @@ SMTP_PORT=587           # 465 for implicit TLS (e.g. some older servers)
 SMTP_USER=you@gmail.com
 SMTP_PASS=your-app-password
 NOTIFY_TO=you@gmail.com
+NOTIFY_URL=https://stream.example.com   # full URL; the email links to /vods on it
 ```
+
+Each VOD is emailed once. The list of announced VODs is kept in
+`VOD_PATH/.notified.json`, so restarts don't re-send old ones (on the very
+first start, VODs already on disk are not emailed).
 
 For **Gmail** you need an [App Password](https://myaccount.google.com/apppasswords)
 (requires 2-Step Verification). For other providers, check their SMTP docs.

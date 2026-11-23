@@ -32,14 +32,16 @@ start_webdav &
 
 while true; do
   if rclone listremotes 2>/dev/null | grep -qx "$REMOTE_NAME:"; then
-    # --min-age 3m skips the file that is still being recorded
+    # --min-age 3m skips the file that is still being recorded.
+    # Thumbnails (.jpg) go too, so cloud-only VODs keep their preview image.
     rclone copy /vods "$DEST" \
-      --include 'vod_*.mp4' --min-age 3m \
+      --include 'vod_*.mp4' --include 'vod_*.jpg' --min-age 3m \
       --transfers 2 --dropbox-chunk-size 64M \
       --retries 5 --low-level-retries 20 \
       --stats 10m --stats-one-line -v
     if [ "$KEEP_DAYS" -gt 0 ] 2>/dev/null; then
-      rclone delete "$DEST" --include 'vod_*.mp4' --min-age "${KEEP_DAYS}d" -v
+      rclone delete "$DEST" --include 'vod_*.mp4' --include 'vod_*.jpg' \
+        --min-age "${KEEP_DAYS}d" -v
     fi
   else
     echo "rclone remote '$REMOTE_NAME' is not set up yet - see README (Cloud backup)"
