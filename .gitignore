@@ -1,3 +1,4 @@
 .env
 vods/
 __pycache__/
+rclone/

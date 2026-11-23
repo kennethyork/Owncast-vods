@@ -11,3 +11,15 @@ services:
       VOD_DIR: /vods
     volumes:
       - ${VOD_PATH:-./vods}:/vods
+
+  # Optional Dropbox backup. Turn on with COMPOSE_PROFILES=dropbox in .env.
+  dropbox:
+    image: rclone/rclone:latest
+    restart: unless-stopped
+    profiles: [dropbox]
+    env_file: .env
+    entrypoint: ["/bin/sh", "/backup.sh"]
+    volumes:
+      - ${VOD_PATH:-./vods}:/vods:ro
+      - ./rclone:/config/rclone
+      - ./dropbox-backup.sh:/backup.sh:ro

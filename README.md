@@ -26,6 +26,7 @@ OBS ──RTMP──► Owncast (Docker) ──HLS──► owncast-vod (Docker)
   and the 4-hour schedule is kept.
 - Old VODs are deleted automatically (14 days by default, or sooner if the disk
   gets low).
+- Optional **Dropbox backup** of every finished VOD.
 - Owncast itself is **not changed**.
 
 ---
@@ -94,7 +95,7 @@ nano .env
 
 In `.env`, set:
 - `OWNCAST_URL` → the port from step 2 (default `http://127.0.0.1:8080`)
-- `WEBHOOK_TOKEN` → any random text (used in step 7)
+- `WEBHOOK_TOKEN` → any random text (used in step 6)
 - `RETENTION_DAYS` → how many days of VODs to keep (see the disk table above)
 - `VOD_PATH` → where to save files (default `./vods`, for example `/mnt/storage/vods`)
 
@@ -102,7 +103,7 @@ Save with `Ctrl+O`, `Enter`, `Ctrl+X`.
 
 ---
 
-## 5. Start the recorder
+## 4. Start the recorder
 
 ```bash
 cd /opt/owncast-vod
@@ -130,7 +131,7 @@ The container restarts on its own after a reboot or a crash
 
 ---
 
-## 6. Add the `/vods` page in CloudPanel
+## 5. Add the `/vods` page in CloudPanel
 
 1. Log in to CloudPanel → **Sites** → **live.kennethyork.com** → **Vhost** tab.
 2. Find the `server {` block that has `listen 443`. Inside it, find the
@@ -155,7 +156,7 @@ The container restarts on its own after a reboot or a crash
 
 ---
 
-## 7. Connect it to Owncast (admin panel)
+## 6. Connect it to Owncast (admin panel)
 
 Open `https://live.kennethyork.com/admin` → **Integrations**.
 
@@ -181,6 +182,87 @@ Test it: stop and restart OBS, then run `docker compose logs` and look for
 
 ---
 
+## 7. Dropbox backup (optional)
+
+A second container uploads every **finished** VOD to your Dropbox. It runs
+every 15 minutes and skips the file that's still recording. It only
+**copies**, so VODs the VPS deletes after `RETENTION_DAYS` stay in Dropbox.
+
+**Plan for space:** at 6 Mbps a day of VODs is about 65 GB, so a 2 TB Dropbox
+fills in about a month. Set `DROPBOX_RETENTION_DAYS` (for example `25`) to keep
+it from filling up.
+
+### 7a. Get a Dropbox token (on your own computer)
+
+The VPS has no browser, so you log in to Dropbox from your PC or Mac once:
+
+1. Install rclone from <https://rclone.org/downloads/>.
+2. In a terminal, run:
+   ```bash
+   rclone authorize "dropbox"
+   ```
+3. A browser opens. Log in to Dropbox and click **Allow**.
+4. The terminal prints a token that starts with `{"access_token":...}`.
+   Copy the whole line, including the `{` and `}`.
+
+### 7b. Give the token to the VPS
+
+On the VPS:
+
+```bash
+cd /opt/owncast-vod
+docker run --rm -it -v "$PWD/rclone:/config/rclone" rclone/rclone config
+```
+
+Answer the prompts:
+
+| Prompt | Type |
+|---|---|
+| `n/s/q>` | `n` (new remote) |
+| `name>` | `dropbox` |
+| `Storage>` | `dropbox` |
+| `client_id>` / `client_secret>` | press Enter (leave blank) |
+| `Edit advanced config?` | `n` |
+| `Use web browser to automatically authenticate?` | `n` |
+| `config_token>` | paste the token from 7a |
+| `Keep this "dropbox" remote?` | `y` |
+| `e/n/d/r/c/s/q>` | `q` (quit) |
+
+Check that it works:
+
+```bash
+docker run --rm -v "$PWD/rclone:/config/rclone" rclone/rclone lsd dropbox:
+```
+
+This should list the folders in your Dropbox.
+
+### 7c. Turn on the backup
+
+```bash
+nano .env
+```
+
+Remove the `#` in front of `COMPOSE_PROFILES=dropbox`. If you like, change
+`DROPBOX_FOLDER` (default `Owncast VODs`) and `DROPBOX_RETENTION_DAYS`. Then:
+
+```bash
+docker compose up -d
+docker compose logs -f dropbox
+```
+
+You should see `dropbox backup: /vods -> dropbox:Owncast VODs every 15 min`,
+then upload lines once a VOD has finished. The first upload happens after the
+current 4-hour block ends.
+
+| Dropbox setting (`.env`) | Default | What it does |
+|---|---|---|
+| `COMPOSE_PROFILES` | off | `dropbox` turns the backup on |
+| `DROPBOX_FOLDER` | `Owncast VODs` | Folder inside your Dropbox |
+| `DROPBOX_INTERVAL_MIN` | `15` | How often to check for finished VODs |
+| `DROPBOX_RETENTION_DAYS` | `0` | Delete from Dropbox after this many days (`0` = never) |
+
+---
+
 ## 8. Daily use
 
 | Task | Command (in `/opt/owncast-vod`) |
@@ -191,6 +273,7 @@ Test it: stop and restart OBS, then run `docker compose logs` and look for
 | Change settings | edit `.env`, then `docker compose up -d` |
 | Update to the latest version | `git pull && docker compose up -d --build` |
 | Check disk usage | `du -sh vods && df -h .` |
+| Dropbox backup log | `docker compose logs -f dropbox` |
 | JSON list of VODs | `curl -s http://127.0.0.1:8090/vods/api/list` |
 
 ### Settings (in `.env`)
@@ -247,6 +330,16 @@ a Cloudflare cache rule that bypasses `/vods/*`.
 
 **Disk filling up**
 Lower `RETENTION_DAYS` or raise `MIN_FREE_GB` in `.env`, then run `docker compose up -d`.
+
+**Dropbox log says "remote 'dropbox' is not set up yet"**
+Redo step 7b. The remote name must be exactly `dropbox`, and you must run the
+command from `/opt/owncast-vod`.
+
+**Dropbox uploads stopped with an auth/token error**
+Reconnect: run `rclone authorize "dropbox"` on your computer again, then on
+the VPS:
+`docker run --rm -it -v "$PWD/rclone:/config/rclone" rclone/rclone config reconnect dropbox:`
+and paste the new token. Then run `docker compose restart dropbox`.
 
 **Webhook does nothing**
 Check that the token in the URL matches `WEBHOOK_TOKEN` in `.env` exactly. The URL must
