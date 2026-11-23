@@ -34,6 +34,7 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 PORT = int(os.environ.get("PORT", "8090"))
 BIND = os.environ.get("BIND", "0.0.0.0")
 TITLE = os.environ.get("TITLE", "Stream VODs")
+LIVE_URL = os.environ.get("LIVE_URL", "/")  # "back to live" link
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")  # optional ?token=...
 
@@ -180,7 +181,7 @@ h1{{font-size:1.3rem}} video{{width:100%;background:#000;border-radius:8px;displ
 .v:hover{{background:#222}} .live{{color:#f55;font-weight:600;margin-left:6px}}
 a{{color:#8ab4f8}} small{{color:#888}}
 </style></head><body>
-<h1>{title}</h1><p><a href="/">← back to live</a></p><video id="p" controls playsinline></video>
+<h1>{title}</h1><p><a href="{live}">← back to live</a></p><video id="p" controls playsinline></video>
 {rows}
 <script>
 document.querySelectorAll('.v').forEach(r=>r.onclick=e=>{{
@@ -206,7 +207,7 @@ def render_page():
                 f'<span><small>{human(v["size"])}</small> &nbsp;'
                 f'<a href="/vods/{f}" download>download</a></span></div>')
         rows = "\n".join(rows)
-    return PAGE.format(title=html.escape(TITLE), rows=rows).encode()
+    return PAGE.format(title=html.escape(TITLE), live=html.escape(LIVE_URL, quote=True), rows=rows).encode()
 
 
 class Handler(BaseHTTPRequestHandler):

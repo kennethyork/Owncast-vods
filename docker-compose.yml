@@ -1,25 +1,28 @@
-# owncast-vod: records your Owncast stream into 4-hour VODs, served at /vods.
-# Settings live in .env (copy .env.example to .env), not in this file.
+# owncast-vod: records an Owncast stream into fixed-length VODs, served at /vods.
+# All settings live in .env (cp .env.example .env), not in this file.
 services:
   vods:
     build: .
     restart: unless-stopped
-    network_mode: host            # reaches Owncast on 127.0.0.1, like CloudPanel's nginx
+    # Host networking lets the recorder reach Owncast on 127.0.0.1 and lets
+    # your reverse proxy reach the recorder on 127.0.0.1:PORT.
+    # Owncast only on a Docker network? See README -> "Owncast on a Docker network".
+    network_mode: host
     env_file: .env
     environment:
-      BIND: 127.0.0.1             # only reachable through nginx, not from the internet
+      BIND: ${BIND:-127.0.0.1}
       VOD_DIR: /vods
     volumes:
       - ${VOD_PATH:-./vods}:/vods
 
-  # Optional Dropbox backup. Turn on with COMPOSE_PROFILES=dropbox in .env.
-  dropbox:
+  # Optional cloud backup with rclone. Turn on with COMPOSE_PROFILES=backup in .env.
+  backup:
     image: rclone/rclone:latest
     restart: unless-stopped
-    profiles: [dropbox]
+    profiles: [backup]
     env_file: .env
     entrypoint: ["/bin/sh", "/backup.sh"]
     volumes:
       - ${VOD_PATH:-./vods}:/vods:ro
       - ./rclone:/config/rclone
-      - ./dropbox-backup.sh:/backup.sh:ro
+      - ./cloud-backup.sh:/backup.sh:ro

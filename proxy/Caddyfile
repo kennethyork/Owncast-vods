@@ -1,0 +1,11 @@
+# Caddy: replace your Owncast site block with this (change the domain and
+# Owncast's port). Caddy gets HTTPS certificates automatically.
+
+stream.example.com {
+	handle /vods* {
+		reverse_proxy 127.0.0.1:8090
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8080
+	}
+}
