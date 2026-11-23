@@ -1,0 +1,13 @@
+# owncast-vod: records your Owncast stream into 4-hour VODs, served at /vods.
+# Settings live in .env (copy .env.example to .env), not in this file.
+services:
+  vods:
+    build: .
+    restart: unless-stopped
+    network_mode: host            # reaches Owncast on 127.0.0.1, like CloudPanel's nginx
+    env_file: .env
+    environment:
+      BIND: 127.0.0.1             # only reachable through nginx, not from the internet
+      VOD_DIR: /vods
+    volumes:
+      - ${VOD_PATH:-./vods}:/vods
