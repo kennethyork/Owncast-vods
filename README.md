@@ -87,7 +87,7 @@ you'll need it in step 3.
 
 ```bash
 cd /opt
-git clone https://github.com/kennethyork/owncast-vod.git
+git clone https://github.com/kennethyork/Owncast-vods.git owncast-vod
 cd owncast-vod
 cp .env.example .env
 nano .env
