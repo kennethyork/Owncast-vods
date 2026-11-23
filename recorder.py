@@ -753,57 +753,100 @@ def vod_exists(name: str) -> bool:
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title><style>
-body{{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px;max-width:900px;margin:auto}}
-h1{{font-size:1.3rem}}
-video{{width:100%;background:#000;border-radius:8px;display:none;margin-bottom:12px}}
-.day{{margin-top:18px;color:#aaa;font-size:.9rem;border-bottom:1px solid #333;padding-bottom:4px}}
-.v{{display:flex;align-items:center;gap:12px;padding:8px;border-radius:6px;cursor:pointer}}
-.v:hover{{background:#222}}
-.thumb{{width:120px;height:68px;object-fit:cover;border-radius:4px;background:#222;flex-shrink:0}}
-.thumb-ph{{width:120px;height:68px;border-radius:4px;background:#1a1a1a;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:1.6rem;color:#444}}
+:root{{--bg:#0e0f13;--card:#171922;--card2:#1e212c;--line:#262a37;--text:#ececf1;--muted:#8d91a5;--gold:#f2b544;--red:#ff4d5e}}
+*{{box-sizing:border-box}}
+body{{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);margin:0 auto;padding:24px 20px 40px;max-width:1200px;-webkit-font-smoothing:antialiased}}
+a{{color:var(--gold);text-decoration:none}} a:hover{{text-decoration:underline}}
+.top{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px;flex-wrap:wrap}}
+.top h1{{margin:0;font-size:1.6rem;font-weight:800;letter-spacing:-.02em}}
+.top .sub{{color:var(--muted);font-size:.9rem;margin-top:2px}}
+.pill{{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border:1px solid var(--line);border-radius:999px;color:var(--text);font-size:.9rem;font-weight:600;background:var(--card)}}
+.pill:hover{{border-color:var(--gold);text-decoration:none}}
+/* player */
+#stage{{display:none;background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:28px;box-shadow:0 10px 30px rgba(0,0,0,.35)}}
+#stage.on{{display:block}}
+video{{width:100%;display:block;background:#000;aspect-ratio:16/9}}
+.np{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line)}}
+.np-k{{color:var(--gold);font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase}}
+#nptitle{{font-weight:700;font-size:1.05rem;margin-top:2px}}
+#npclose{{background:none;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:6px 10px;cursor:pointer;font:inherit;font-size:.85rem}}
+#npclose:hover{{color:var(--text);border-color:var(--muted)}}
+/* list */
+.day{{display:flex;align-items:center;gap:12px;margin:26px 0 12px;color:var(--muted);font-size:.78rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase}}
+.day::after{{content:"";flex:1;height:1px;background:var(--line)}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:18px}}
+.v{{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s}}
+.v:hover{{transform:translateY(-3px);border-color:#3a3f52;box-shadow:0 8px 22px rgba(0,0,0,.4)}}
+.v.active{{border-color:var(--gold);box-shadow:0 0 0 1px var(--gold)}}
+.tw{{position:relative;aspect-ratio:16/9;background:linear-gradient(135deg,#1c1f2a,#11131a)}}
+.thumb{{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}}
+.thumb-ph{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#3a3f52;font-size:2.2rem}}
+.play{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.35);opacity:0;transition:opacity .15s}}
+.play span{{width:54px;height:54px;border-radius:50%;background:var(--gold);color:#111;display:flex;align-items:center;justify-content:center;font-size:1.3rem;padding-left:4px;box-shadow:0 4px 14px rgba(0,0,0,.5)}}
+.v:hover .play{{opacity:1}}
+.dur{{position:absolute;right:8px;bottom:8px;background:rgba(0,0,0,.8);color:#fff;font-size:.75rem;font-weight:600;padding:2px 6px;border-radius:4px;font-variant-numeric:tabular-nums}}
+.badge{{position:absolute;left:8px;top:8px;font-size:.68rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:4px}}
+.live{{background:var(--red);color:#fff;animation:pulse 1.6s infinite}}
+.cloud{{background:rgba(0,0,0,.7);color:#cfd6ff}}
+@keyframes pulse{{50%{{opacity:.6}}}}
+.vb{{display:flex;align-items:flex-start;gap:8px;padding:12px 14px 14px}}
 .vinfo{{flex:1;min-width:0}}
-.vtitle{{font-size:.95rem}}
-.vmeta{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px}}
-.live{{color:#f55;font-weight:600}}
-.cloud{{color:#8ab4f8;font-size:.8rem}}
-.vactions{{margin-left:auto;white-space:nowrap}}
-a{{color:#8ab4f8}} small{{color:#888}}
+.vtitle{{font-weight:700;font-size:.95rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.vmeta{{color:var(--muted);font-size:.8rem;margin-top:4px}}
+.dl{{flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:8px;border:1px solid var(--line);background:none;color:var(--muted);cursor:pointer;font-size:.95rem;text-decoration:none}}
+.dl:hover{{color:var(--gold);border-color:var(--gold);text-decoration:none}}
+.empty{{text-align:center;padding:60px 20px;color:var(--muted);background:var(--card);border:1px dashed var(--line);border-radius:14px}}
+.empty b{{display:block;color:var(--text);font-size:1.05rem;margin-bottom:4px}}
 /* login modal */
 #modal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);align-items:center;justify-content:center;z-index:99}}
 #modal.open{{display:flex}}
-#mbox{{background:#1e1e1e;padding:24px;border-radius:10px;min-width:260px;text-align:center}}
+#mbox{{background:var(--card);border:1px solid var(--line);padding:24px;border-radius:14px;min-width:280px;text-align:center}}
 #mbox h2{{margin:0 0 16px;font-size:1rem}}
-#mbox input{{width:100%;padding:8px;border:1px solid #444;border-radius:6px;background:#111;color:#eee;font-size:1rem;box-sizing:border-box}}
-#mbox button{{margin-top:12px;width:100%;padding:9px;background:#8ab4f8;color:#000;border:0;border-radius:6px;font-size:1rem;cursor:pointer;font-weight:600}}
-#merr{{color:#f55;font-size:.85rem;margin-top:8px;min-height:1em}}
+#mbox input{{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font-size:1rem}}
+#mbox button{{margin-top:12px;width:100%;padding:10px;background:var(--gold);color:#111;border:0;border-radius:8px;font-size:1rem;cursor:pointer;font-weight:700}}
+#merr{{color:var(--red);font-size:.85rem;margin-top:8px;min-height:1em}}
 /* comments */
-#cbox{{display:none;margin:0 0 16px;padding:12px;background:#181818;border-radius:8px}}
-#cbox h2{{margin:0 0 8px;font-size:1rem}}
-.c{{padding:6px 0;border-bottom:1px solid #222}}
-.cn{{font-weight:600;margin-right:6px}}
-.ct,.cpos{{color:#888;font-size:.8rem;margin-right:6px}}
-.cpos{{cursor:pointer;color:#8ab4f8}}
-.cdel{{background:none;border:0;color:#888;cursor:pointer;font-size:.8rem;float:right}}
-.cx{{white-space:pre-wrap;word-wrap:break-word;margin-top:2px}}
-#ctext{{width:100%;box-sizing:border-box;min-height:60px;margin-top:10px;padding:8px;background:#111;color:#eee;border:1px solid #444;border-radius:6px;font:inherit}}
-#cpost{{margin-top:6px;padding:7px 16px;background:#8ab4f8;color:#000;border:0;border-radius:6px;font-weight:600;cursor:pointer}}
-#cmsg{{color:#aaa;font-size:.85rem;margin-top:6px}}
+#cbox{{display:none;padding:16px 18px 18px}}
+#cbox h2{{margin:0 0 10px;font-size:.95rem}}
+.c{{padding:10px 0;border-bottom:1px solid var(--line)}}
+.c:last-child{{border-bottom:0}}
+.cn{{font-weight:700;margin-right:8px}}
+.ct,.cpos{{color:var(--muted);font-size:.78rem;margin-right:8px}}
+.cpos{{cursor:pointer;color:var(--gold);font-weight:600;font-variant-numeric:tabular-nums}}
+.cdel{{background:none;border:0;color:var(--muted);cursor:pointer;font-size:.78rem;float:right}}
+.cdel:hover{{color:var(--red)}}
+.cx{{white-space:pre-wrap;word-wrap:break-word;margin-top:3px;line-height:1.45}}
+#ctext{{width:100%;min-height:70px;margin-top:12px;padding:10px 12px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:10px;font:inherit;resize:vertical}}
+#ctext:focus{{outline:none;border-color:var(--gold)}}
+#cpost{{margin-top:8px;padding:8px 18px;background:var(--gold);color:#111;border:0;border-radius:8px;font-weight:700;cursor:pointer;font:inherit;font-weight:700}}
+#cpost:disabled{{opacity:.6}}
+#cmsg{{color:var(--muted);font-size:.85rem;margin-top:8px}}
+@media (max-width:520px){{body{{padding:16px 12px 32px}}.grid{{grid-template-columns:1fr 1fr;gap:12px}}.vb{{padding:10px}}.vtitle{{font-size:.85rem}}.dl{{display:none}}}}
 {embed_css}
 </style></head><body>
 {header}
-<video id="p" controls playsinline></video>
-{comments_box}
+<div id="stage"><video id="p" controls playsinline></video>
+<div class="np"><div><div class="np-k">Now playing</div><div id="nptitle"></div></div>
+<button id="npclose" type="button">✕ Close</button></div>
+{comments_box}</div>
 {rows}
 {login_modal}
 <script>
+var _stage=document.getElementById('stage'),_p=document.getElementById('p');
 document.querySelectorAll('.v').forEach(r=>r.onclick=e=>{{
   if(e.target.tagName==='A'||e.target.closest('button'))return;
-  var p=document.getElementById('p'),src=r.dataset.f,th=r.dataset.th||'';
-  p.style.display='block';
-  if(th)p.poster=th; else p.removeAttribute('poster');
-  p.src=src;p.play();scrollTo(0,0);
+  var src=r.dataset.f,th=r.dataset.th||'';
+  _stage.classList.add('on');
+  document.querySelectorAll('.v.active').forEach(x=>x.classList.remove('active'));r.classList.add('active');
+  document.getElementById('nptitle').textContent=r.dataset.t||'';
+  if(th)_p.poster=th; else _p.removeAttribute('poster');
+  _p.src=src;_p.play();scrollTo({{top:0,behavior:'smooth'}});
   if(window.loadComments)loadComments(r.dataset.n);
 }});
+document.getElementById('npclose').onclick=function(){{
+  _p.pause();_p.removeAttribute('src');_p.load();_stage.classList.remove('on');
+  document.querySelectorAll('.v.active').forEach(x=>x.classList.remove('active'));
+}};
 {login_js}
 {comments_js}
 </script></body></html>"""
@@ -890,21 +933,56 @@ OPEN_DOWNLOAD_JS = ""  # no modal needed when downloads are open
 
 # ?embed=1: compact version for an iframe on the Owncast page (no title or
 # back link, no page background, fills the frame's width)
-EMBED_CSS = "body{background:transparent;padding:0 4px;max-width:none}.day:first-of-type{margin-top:4px}"
+EMBED_CSS = "body{background:transparent;padding:4px 2px 8px;max-width:none}.day:first-of-type{margin-top:4px}"
+
+
+def _vod_start(v) -> float:
+    """Start time of a VOD (local time zone) from its file name."""
+    return time.mktime(time.strptime(f'{v["date"]} {v["start"]}', "%Y-%m-%d %H:%M"))
+
+
+def _day_label(date: str) -> str:
+    t = time.strptime(date, "%Y-%m-%d")
+    today = time.strftime("%Y-%m-%d")
+    yesterday = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+    if date == today:
+        return "Today"
+    if date == yesterday:
+        return "Yesterday"
+    return f'{time.strftime("%A, %B", t)} {t.tm_mday}'
+
+
+def _clock(hhmm: str) -> str:
+    h, m = map(int, hhmm.split(":"))
+    return f'{(h % 12) or 12}:{m:02d} {"AM" if h < 12 else "PM"}'
+
+
+def _duration(v) -> str:
+    """Approximate length of a finished local VOD: last write minus start."""
+    if v.get("recording") or not v.get("mtime"):
+        return ""
+    s = int(v["mtime"] - _vod_start(v))
+    if not 0 < s < 2 * 86400:
+        return ""
+    h, m, s = s // 3600, s % 3600 // 60, s % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def render_page(authed: bool = False, embed: bool = False):
     """authed=True means the request already has a valid admin cookie."""
     vods = merged_vods()
     if not vods:
-        rows = "<p>No VODs yet.</p>"
+        rows = ('<div class="empty"><b>No past streams yet</b>'
+                'Recordings show up here after each stream.</div>')
     else:
         rows, day = [], None
         gate = ADMIN_PASSWORD != ""
         for v in vods:
             if v["date"] != day:
+                if day is not None:
+                    rows.append("</div>")
                 day = v["date"]
-                rows.append(f'<div class="day">{day}</div>')
+                rows.append(f'<div class="day">{_day_label(day)}</div><div class="grid">')
             f = html.escape(v["name"])
             is_cloud = v.get("cloud", False)
             has_thumb = v.get("thumb", False)
@@ -918,9 +996,15 @@ def render_page(authed: bool = False, embed: bool = False):
                 thumb_html = '<div class="thumb-ph">▶</div>'
                 data_th = ""
 
-            # Badges
-            live_badge = '<span class="live">● recording</span>' if v.get("recording") else ""
-            cloud_badge = '<span class="cloud">☁ cloud</span>' if is_cloud else ""
+            # Overlays: badge top-left, duration bottom-right
+            if v.get("recording"):
+                badge = '<span class="badge live">● Recording</span>'
+            elif is_cloud:
+                badge = '<span class="badge cloud">☁ Cloud</span>'
+            else:
+                badge = ""
+            dur = _duration(v)
+            dur_html = f'<span class="dur">{dur}</span>' if dur else ""
 
             # Player src (signed + expiring when a password is set)
             play = ("" if authed else _play_query(v["name"])).replace("&", "&amp;")
@@ -928,23 +1012,27 @@ def render_page(authed: bool = False, embed: bool = False):
 
             # Download link/button
             if gate and not authed:
-                dl = (f'<button style="background:none;border:none;cursor:pointer;'
-                      f'color:#8ab4f8;font-size:.9rem" '
-                      f'onclick="openLogin(\'{f}\',{str(is_cloud).lower()})">🔒 download</button>')
+                dl = (f'<button class="dl" title="Download (admin)" '
+                      f'onclick="openLogin(\'{f}\',{str(is_cloud).lower()})">🔒</button>')
             else:
                 dl_href = f"/vods/cloud/{f}?dl=1" if is_cloud else f"/vods/download/{f}"
-                dl = f'<a href="{dl_href}" download>download</a>'
+                dl = f'<a class="dl" href="{dl_href}" title="Download" download>⤓</a>'
 
+            clock = _clock(v["start"])
+            short_date = time.strftime("%b %d", time.strptime(v["date"], "%Y-%m-%d")).replace(" 0", " ")
+            title = f"Stream · {clock}"
             rows.append(
-                f'<div class="v" data-f="{player_src}" data-n="{f}"{data_th}>'
-                f'{thumb_html}'
-                f'<div class="vinfo">'
-                f'<div class="vtitle">▶ {v["date"]} {v["start"]}{" " if live_badge or cloud_badge else ""}{live_badge}{cloud_badge}</div>'
-                f'<div class="vmeta"><small>{human(v["size"])}</small></div>'
-                f'</div>'
-                f'<div class="vactions">{dl}</div>'
+                f'<div class="v" data-f="{player_src}" data-n="{f}" '
+                f'data-t="{html.escape(f"{short_date} · {clock}", quote=True)}"{data_th}>'
+                f'<div class="tw">{thumb_html}{badge}{dur_html}'
+                f'<div class="play"><span>▶</span></div></div>'
+                f'<div class="vb"><div class="vinfo">'
+                f'<div class="vtitle">{title}</div>'
+                f'<div class="vmeta">{short_date} · {human(v["size"])}</div>'
+                f'</div>{dl}</div>'
                 f'</div>'
             )
+        rows.append("</div>")
         rows = "\n".join(rows)
 
     if ADMIN_PASSWORD and not authed:
@@ -956,8 +1044,9 @@ def render_page(authed: bool = False, embed: bool = False):
 
     return PAGE.format(
         title=html.escape(TITLE),
-        header="" if embed else (f'<h1>{html.escape(TITLE)}</h1>'
-                                 f'<p><a href="{html.escape(LIVE_URL, quote=True)}">← back to live</a></p>'),
+        header="" if embed else (f'<div class="top"><div><h1>{html.escape(TITLE)}</h1>'
+                                 f'<div class="sub">{len(vods)} recording{"" if len(vods) == 1 else "s"}</div></div>'
+                                 f'<a class="pill" href="{html.escape(LIVE_URL, quote=True)}">← Back to live</a></div>'),
         embed_css=EMBED_CSS if embed else "",
         rows=rows,
         login_modal=modal,
