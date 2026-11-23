@@ -788,8 +788,9 @@ a{{color:#8ab4f8}} small{{color:#888}}
 #ctext{{width:100%;box-sizing:border-box;min-height:60px;margin-top:10px;padding:8px;background:#111;color:#eee;border:1px solid #444;border-radius:6px;font:inherit}}
 #cpost{{margin-top:6px;padding:7px 16px;background:#8ab4f8;color:#000;border:0;border-radius:6px;font-weight:600;cursor:pointer}}
 #cmsg{{color:#aaa;font-size:.85rem;margin-top:6px}}
+{embed_css}
 </style></head><body>
-<h1>{title}</h1><p><a href="{live}">← back to live</a></p>
+{header}
 <video id="p" controls playsinline></video>
 {comments_box}
 {rows}
@@ -887,8 +888,12 @@ function doLogin(){
 
 OPEN_DOWNLOAD_JS = ""  # no modal needed when downloads are open
 
+# ?embed=1: compact version for an iframe on the Owncast page (no title or
+# back link, no page background, fills the frame's width)
+EMBED_CSS = "body{background:transparent;padding:0 4px;max-width:none}.day:first-of-type{margin-top:4px}"
 
-def render_page(authed: bool = False):
+
+def render_page(authed: bool = False, embed: bool = False):
     """authed=True means the request already has a valid admin cookie."""
     vods = merged_vods()
     if not vods:
@@ -951,7 +956,9 @@ def render_page(authed: bool = False):
 
     return PAGE.format(
         title=html.escape(TITLE),
-        live=html.escape(LIVE_URL, quote=True),
+        header="" if embed else (f'<h1>{html.escape(TITLE)}</h1>'
+                                 f'<p><a href="{html.escape(LIVE_URL, quote=True)}">← back to live</a></p>'),
+        embed_css=EMBED_CSS if embed else "",
         rows=rows,
         login_modal=modal,
         login_js=js,
@@ -982,8 +989,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/vods", "/vods/"):
             authed = _download_allowed(self)
+            embed = "embed" in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             # no-store: the page holds expiring playback links
-            return self._send(200, render_page(authed), "text/html; charset=utf-8",
+            return self._send(200, render_page(authed, embed), "text/html; charset=utf-8",
                               extra={"Cache-Control": "no-store"})
         if path in ("/", ""):
             return self._send(302, extra={"Location": "/vods"})
