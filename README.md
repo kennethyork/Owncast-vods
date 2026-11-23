@@ -383,6 +383,15 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `COMPOSE_PROFILES` | – | `backup` turns on cloud backup |
 | `CLOUD_PORT` | `8091` | WebDAV port inside the backup container |
 | `CLOUD_URL` | – | `http://127.0.0.1:8091` enables cloud playback on /vods |
+| `THUMB_ENABLED` | `1` | `0` disables thumbnail generation |
+| `THUMB_OFFSET` | `60` | Seconds into the VOD to grab the thumbnail frame |
+| `SMTP_HOST` | – | SMTP server for email notifications (empty = off) |
+| `SMTP_PORT` | `587` | `465` for implicit TLS; `587` for STARTTLS |
+| `SMTP_USER` | – | SMTP login username |
+| `SMTP_PASS` | – | SMTP password / app password |
+| `SMTP_FROM` | `SMTP_USER` | Sender address (defaults to `SMTP_USER`) |
+| `NOTIFY_TO` | – | Comma-separated recipient addresses |
+| `NOTIFY_URL` | `LIVE_URL` | Base URL shown in the notification email |
 | `BACKUP_REMOTE` | `dropbox` | rclone remote name |
 | `BACKUP_FOLDER` | `Owncast VODs` | Folder (or bucket/folder) on the remote |
 | `BACKUP_INTERVAL_MIN` | `15` | Minutes between upload runs |
@@ -411,6 +420,38 @@ Generate a strong password:
 ```bash
 openssl rand -hex 20
 ```
+
+### Thumbnails
+
+The recorder automatically generates a JPEG thumbnail for each finished VOD
+using ffmpeg. Thumbnails appear as poster images on the `/vods` page and as
+the video poster inside the player.
+
+```env
+THUMB_ENABLED=1    # 0 to disable
+THUMB_OFFSET=60    # grab the frame at this many seconds into the VOD
+```
+
+Thumbnails are stored alongside the VOD file (`.jpg` with the same name) and
+are removed automatically when the VOD is deleted.
+
+### Email notifications
+
+When a VOD finishes recording, the recorder sends an HTML email with a link to
+the VOD page so you know it's ready to download for YouTube.
+
+```env
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587           # 465 for implicit TLS (e.g. some older servers)
+SMTP_USER=you@gmail.com
+SMTP_PASS=your-app-password
+NOTIFY_TO=you@gmail.com
+```
+
+For **Gmail** you need an [App Password](https://myaccount.google.com/apppasswords)
+(requires 2-Step Verification). For other providers, check their SMTP docs.
+
+Leave `SMTP_HOST` empty to disable email notifications entirely.
 
 ---
 

@@ -7,10 +7,14 @@ a small VOD browser page you can link from Owncast as an External Action.
 Only needs Python 3.9+ (stdlib) and ffmpeg.
 """
 import base64
+import email.mime.multipart
+import email.mime.text
 import hashlib
 import hmac
 import html
 import json
+import smtplib
+import ssl
 import xml.etree.ElementTree as ET
 import os
 import re
@@ -46,6 +50,20 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # download gate; empty = 
 # WebDAV base URL served by the rclone backup container (cloud playback).
 # Empty string disables cloud listing entirely.
 CLOUD_URL = os.environ.get("CLOUD_URL", "").rstrip("/")  # e.g. http://127.0.0.1:8091
+
+# ---- Thumbnails ----
+# Set to "" to disable thumbnail generation.
+THUMB_ENABLED = os.environ.get("THUMB_ENABLED", "1") not in ("0", "false", "no", "")
+THUMB_OFFSET = int(os.environ.get("THUMB_OFFSET", "60"))  # seconds into VOD to grab
+
+# ---- Email notifications ----
+SMTP_HOST = os.environ.get("SMTP_HOST", "")          # e.g. smtp.gmail.com
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)   # defaults to SMTP_USER
+NOTIFY_TO = os.environ.get("NOTIFY_TO", "")          # comma-separated recipients
+NOTIFY_URL = os.environ.get("NOTIFY_URL", LIVE_URL)  # link in the email body
 
 FILE_RE = re.compile(r"^vod_(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})\.mp4$")
 
@@ -145,6 +163,8 @@ class Recorder:
             self.proc = None
 
     def loop(self):
+        # Track which VODs we've already processed (thumbnail + email).
+        seen: set = set()
         while True:
             online = self.stream_online()
             if online and not self.running:
@@ -152,6 +172,14 @@ class Recorder:
             elif not online and self.running:
                 self.stop()
             cleanup()
+            # Detect newly finished VODs (not currently recording).
+            for v in list_vods():
+                name = v["name"]
+                if name in seen or v.get("recording"):
+                    continue
+                seen.add(name)
+                make_thumb_bg(name)
+                notify_bg(v)
             self.wake.wait(POLL_SECONDS)
             self.wake.clear()
 
@@ -174,6 +202,7 @@ def list_vods():
                 "start": f"{m.group(2)}:{m.group(3)}",
                 "size": st.st_size,
                 "mtime": st.st_mtime,
+                "thumb": thumb_path(p.name).exists(),
             })
     out.sort(key=lambda v: v["name"], reverse=True)
     if out and rec.running:
@@ -201,6 +230,13 @@ def _delete(v, why):
         log("deleted", v["name"], f"({why})")
     except OSError as e:
         log("delete failed", v["name"], e)
+    # Remove the matching thumbnail too
+    jpg = thumb_path(v["name"])
+    if jpg.exists():
+        try:
+            jpg.unlink()
+        except OSError:
+            pass
 
 
 def human(n):
@@ -209,6 +245,113 @@ def human(n):
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+# ---------------------------------------------------------- thumbnails ------
+def thumb_path(vod_name: str) -> Path:
+    return VOD_DIR / (vod_name[:-4] + ".jpg")  # vod_*.mp4 → vod_*.jpg
+
+
+def make_thumb(vod_name: str):
+    """Extract a JPEG thumbnail at THUMB_OFFSET seconds using ffmpeg.
+    Runs in a background thread; silently skips if ffmpeg fails."""
+    if not THUMB_ENABLED:
+        return
+    mp4 = VOD_DIR / vod_name
+    jpg = thumb_path(vod_name)
+    if jpg.exists():
+        return  # already done
+    try:
+        result = subprocess.run(
+            [
+                FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-ss", str(THUMB_OFFSET),
+                "-i", str(mp4),
+                "-vframes", "1",
+                "-vf", "scale=640:-1",
+                "-q:v", "5",
+                "-y", str(jpg),
+            ],
+            timeout=30,
+            capture_output=True,
+        )
+        if result.returncode == 0 and jpg.exists():
+            log("thumbnail created:", jpg.name)
+        else:
+            log("thumbnail failed for", vod_name, result.stderr.decode(errors="replace")[:200])
+    except Exception as e:
+        log("thumbnail error:", e)
+
+
+def make_thumb_bg(vod_name: str):
+    """Kick off thumbnail generation in a daemon thread."""
+    threading.Thread(target=make_thumb, args=(vod_name,), daemon=True).start()
+
+
+# ------------------------------------------------------- email notify -------
+def send_email(vod: dict):
+    """Send a notification email when a VOD finishes. No-op if SMTP not configured."""
+    if not (SMTP_HOST and NOTIFY_TO and SMTP_USER):
+        return
+    recipients = [r.strip() for r in NOTIFY_TO.split(",") if r.strip()]
+    if not recipients:
+        return
+    name = vod["name"]
+    date = vod["date"]
+    start = vod["start"]
+    size = human(vod["size"])
+    vod_url = NOTIFY_URL.rstrip("/") + f"/vods"
+
+    subject = f"[{TITLE}] New VOD ready – {date} {start}"
+    body_text = (
+        f"A new VOD is ready on {TITLE}.\n\n"
+        f"  Date:  {date}\n"
+        f"  Start: {start}\n"
+        f"  Size:  {size}\n"
+        f"  File:  {name}\n\n"
+        f"Watch or download at: {vod_url}\n"
+    )
+    body_html = f"""<html><body style="font-family:sans-serif;color:#222">
+<h2 style="color:#333">New VOD ready on {html.escape(TITLE)}</h2>
+<table style="border-collapse:collapse">
+  <tr><td style="padding:4px 12px 4px 0;color:#666">Date</td><td><b>{html.escape(date)}</b></td></tr>
+  <tr><td style="padding:4px 12px 4px 0;color:#666">Start</td><td><b>{html.escape(start)}</b></td></tr>
+  <tr><td style="padding:4px 12px 4px 0;color:#666">Size</td><td>{html.escape(size)}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;color:#666">File</td><td><code>{html.escape(name)}</code></td></tr>
+</table>
+<p style="margin-top:20px">
+  <a href="{html.escape(vod_url, quote=True)}" style="background:#333;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none">
+    Watch / Download →
+  </a>
+</p>
+</body></html>"""
+
+    msg = email.mime.multipart.MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM or SMTP_USER
+    msg["To"] = ", ".join(recipients)
+    msg.attach(email.mime.text.MIMEText(body_text, "plain"))
+    msg.attach(email.mime.text.MIMEText(body_html, "html"))
+
+    try:
+        ctx = ssl.create_default_context()
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=15) as s:
+                s.login(SMTP_USER, SMTP_PASS)
+                s.sendmail(msg["From"], recipients, msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.ehlo()
+                s.starttls(context=ctx)
+                s.login(SMTP_USER, SMTP_PASS)
+                s.sendmail(msg["From"], recipients, msg.as_string())
+        log("email sent to", ", ".join(recipients), "for", name)
+    except Exception as e:
+        log("email failed:", e)
+
+
+def notify_bg(vod: dict):
+    threading.Thread(target=send_email, args=(vod,), daemon=True).start()
 
 
 # ---------------------------------------------------------- cloud listing ----
@@ -292,26 +435,41 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title><style>
 body{{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px;max-width:900px;margin:auto}}
-h1{{font-size:1.3rem}} video{{width:100%;background:#000;border-radius:8px;display:none;margin-bottom:12px}}
+h1{{font-size:1.3rem}}
+video{{width:100%;background:#000;border-radius:8px;display:none;margin-bottom:12px}}
 .day{{margin-top:18px;color:#aaa;font-size:.9rem;border-bottom:1px solid #333;padding-bottom:4px}}
-.v{{display:flex;justify-content:space-between;align-items:center;padding:10px;border-radius:6px;cursor:pointer}}
-.v:hover{{background:#222}} .live{{color:#f55;font-weight:600;margin-left:6px}}
+.v{{display:flex;align-items:center;gap:12px;padding:8px;border-radius:6px;cursor:pointer}}
+.v:hover{{background:#222}}
+.thumb{{width:120px;height:68px;object-fit:cover;border-radius:4px;background:#222;flex-shrink:0}}
+.thumb-ph{{width:120px;height:68px;border-radius:4px;background:#1a1a1a;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:1.6rem;color:#444}}
+.vinfo{{flex:1;min-width:0}}
+.vtitle{{font-size:.95rem}}
+.vmeta{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px}}
+.live{{color:#f55;font-weight:600}}
+.cloud{{color:#8ab4f8;font-size:.8rem}}
+.vactions{{margin-left:auto;white-space:nowrap}}
 a{{color:#8ab4f8}} small{{color:#888}}
 /* login modal */
 #modal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);align-items:center;justify-content:center;z-index:99}}
 #modal.open{{display:flex}}
 #mbox{{background:#1e1e1e;padding:24px;border-radius:10px;min-width:260px;text-align:center}}
-#mbox h2{{margin:0 0 16px;font-size:1rem}} #mbox input{{width:100%;padding:8px;border:1px solid #444;border-radius:6px;background:#111;color:#eee;font-size:1rem;box-sizing:border-box}}
+#mbox h2{{margin:0 0 16px;font-size:1rem}}
+#mbox input{{width:100%;padding:8px;border:1px solid #444;border-radius:6px;background:#111;color:#eee;font-size:1rem;box-sizing:border-box}}
 #mbox button{{margin-top:12px;width:100%;padding:9px;background:#8ab4f8;color:#000;border:0;border-radius:6px;font-size:1rem;cursor:pointer;font-weight:600}}
 #merr{{color:#f55;font-size:.85rem;margin-top:8px;min-height:1em}}
 </style></head><body>
-<h1>{title}</h1><p><a href="{live}">← back to live</a></p><video id="p" controls playsinline></video>
+<h1>{title}</h1><p><a href="{live}">← back to live</a></p>
+<video id="p" controls playsinline></video>
 {rows}
 {login_modal}
 <script>
 document.querySelectorAll('.v').forEach(r=>r.onclick=e=>{{
- if(e.target.tagName==='A'||e.target.closest('button'))return;const p=document.getElementById('p');
- p.style.display='block';p.src=r.dataset.f;p.play();scrollTo(0,0);}});
+  if(e.target.tagName==='A'||e.target.closest('button'))return;
+  var p=document.getElementById('p'),src=r.dataset.f,th=r.dataset.th||'';
+  p.style.display='block';
+  if(th)p.poster=th; else p.removeAttribute('poster');
+  p.src=src;p.play();scrollTo(0,0);
+}});
 {login_js}
 </script></body></html>"""
 
@@ -359,18 +517,43 @@ def render_page(authed: bool = False):
                 rows.append(f'<div class="day">{day}</div>')
             f = html.escape(v["name"])
             is_cloud = v.get("cloud", False)
-            live = '<span class="live">● recording</span>' if v.get("recording") else ""
-            cloud_badge = ' <span title="stored in cloud" style="color:#8ab4f8;font-size:.8rem">☁</span>' if is_cloud else ""
-            # src for the player: cloud files go through the proxy route
+            has_thumb = v.get("thumb", False)
+
+            # Thumbnail or placeholder
+            if has_thumb:
+                thumb_src = f"/vods/thumb/{f[:-4]}.jpg"
+                thumb_html = f'<img class="thumb" src="{thumb_src}" alt="" loading="lazy">'
+                data_th = f' data-th="{thumb_src}"'
+            else:
+                thumb_html = '<div class="thumb-ph">▶</div>'
+                data_th = ""
+
+            # Badges
+            live_badge = '<span class="live">● recording</span>' if v.get("recording") else ""
+            cloud_badge = '<span class="cloud">☁ cloud</span>' if is_cloud else ""
+
+            # Player src
             player_src = f"/vods/cloud/{f}" if is_cloud else f"/vods/{f}"
+
+            # Download link/button
             if gate and not authed:
-                dl = f'<button style="background:none;border:none;cursor:pointer;color:#8ab4f8;font-size:.9rem" onclick="openLogin(\'{f}\',{str(is_cloud).lower()})">🔒 download</button>'
+                dl = (f'<button style="background:none;border:none;cursor:pointer;'
+                      f'color:#8ab4f8;font-size:.9rem" '
+                      f'onclick="openLogin(\'{f}\',{str(is_cloud).lower()})">🔒 download</button>')
             else:
                 dl_href = f"/vods/cloud/{f}?dl=1" if is_cloud else f"/vods/download/{f}"
                 dl = f'<a href="{dl_href}" download>download</a>'
+
             rows.append(
-                f'<div class="v" data-f="{player_src}"><span>▶ {v["start"]}{live}{cloud_badge}</span>'
-                f'<span><small>{human(v["size"])}</small> &nbsp;{dl}</span></div>')
+                f'<div class="v" data-f="{player_src}"{data_th}>'
+                f'{thumb_html}'
+                f'<div class="vinfo">'
+                f'<div class="vtitle">▶ {v["date"]} {v["start"]}{" " if live_badge or cloud_badge else ""}{live_badge}{cloud_badge}</div>'
+                f'<div class="vmeta"><small>{human(v["size"])}</small></div>'
+                f'</div>'
+                f'<div class="vactions">{dl}</div>'
+                f'</div>'
+            )
         rows = "\n".join(rows)
 
     if ADMIN_PASSWORD and not authed:
@@ -430,6 +613,9 @@ class Handler(BaseHTTPRequestHandler):
             if force_dl and not _download_allowed(self):
                 return self._send(403, b"login required")
             return self.proxy_cloud(name, download=force_dl)
+        # /vods/thumb/<name>.jpg  — VOD thumbnail (public)
+        if path.startswith("/vods/thumb/"):
+            return self.serve_thumb(urllib.parse.unquote(path[len("/vods/thumb/"):]))
         # /vods/<name>  — streaming (always allowed; browser can play without auth)
         if path.startswith("/vods/"):
             return self.serve_file(urllib.parse.unquote(path[6:]))
@@ -520,6 +706,20 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+
+    def serve_thumb(self, name):
+        """Serve a VOD thumbnail JPEG. name is the .jpg filename."""
+        # Accept either vod_*.jpg directly or vod_*.mp4 (derive jpg name)
+        if name.endswith(".mp4"):
+            name = name[:-4] + ".jpg"
+        if not re.match(r"^vod_\d{4}-\d{2}-\d{2}_\d{6}\.jpg$", name):
+            return self._send(404, b"not found")
+        p = VOD_DIR / name
+        if not p.is_file():
+            return self._send(404, b"not found")
+        data = p.read_bytes()
+        self._send(200, data, "image/jpeg",
+                   extra={"Cache-Control": "public, max-age=86400"})
 
     def proxy_cloud(self, name, download=False):
         """Proxy a cloud VOD from rclone WebDAV, with Range passthrough.
