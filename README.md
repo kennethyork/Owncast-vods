@@ -94,6 +94,7 @@ At minimum, set these in `.env`:
 | `OWNCAST_URL` | Owncast's address (see step 3) |
 | `TZ` | Your time zone, e.g. `America/New_York`, `Europe/London` |
 | `WEBHOOK_TOKEN` | Any random text, e.g. from `openssl rand -hex 16` |
+| `ADMIN_PASSWORD` | Password to gate downloads (leave empty to allow everyone) |
 | `RETENTION_DAYS` | Days of VODs to keep (see the disk table) |
 
 All other settings are explained in [Settings](#8-settings). `.env` isn't
@@ -351,14 +352,36 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `PORT` | `8090` | VOD page port |
 | `BIND` | `127.0.0.1` | `0.0.0.0` to listen on all interfaces |
 | `WEBHOOK_TOKEN` | – | Required `?token=` on the webhook URL |
+| `ADMIN_PASSWORD` | – | Password to download VODs (empty = no gate) |
 | `COMPOSE_PROFILES` | – | `backup` turns on cloud backup |
 | `BACKUP_REMOTE` | `dropbox` | rclone remote name |
 | `BACKUP_FOLDER` | `Owncast VODs` | Folder (or bucket/folder) on the remote |
 | `BACKUP_INTERVAL_MIN` | `15` | Minutes between upload runs |
 | `BACKUP_RETENTION_DAYS` | `0` | Delete from the remote after N days (`0` = never) |
 
-**Endpoints:** `/vods` (page), `/vods/<file>.mp4` (video, supports seeking),
-`/vods/api/list` (JSON), `/vods/webhook` (Owncast webhook).
+**Endpoints:** `/vods` (page), `/vods/<file>.mp4` (video stream, no auth),
+`/vods/download/<file>.mp4` (download, gated by `ADMIN_PASSWORD`),
+`/vods/login` (POST, sets session cookie), `/vods/api/list` (JSON),
+`/vods/webhook` (Owncast webhook).
+
+### Admin downloads
+
+Set `ADMIN_PASSWORD` in `.env` to protect downloads (e.g. for uploading to YouTube)
+while keeping the VOD page and in-browser playback open to everyone:
+
+```env
+ADMIN_PASSWORD=supersecretpassword
+```
+
+After setting it, the download link on `/vods` becomes a 🔒 button.
+Click it → enter the password → the browser downloads the file.
+The session lasts 24 hours (one cookie, no database needed).
+Leave `ADMIN_PASSWORD` empty to allow anyone to download.
+
+Generate a strong password:
+```bash
+openssl rand -hex 20
+```
 
 ---
 

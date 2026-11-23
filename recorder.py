@@ -6,10 +6,14 @@ a small VOD browser page you can link from Owncast as an External Action.
 
 Only needs Python 3.9+ (stdlib) and ffmpeg.
 """
+import base64
+import hashlib
+import hmac
 import html
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -37,8 +41,41 @@ TITLE = os.environ.get("TITLE", "Stream VODs")
 LIVE_URL = os.environ.get("LIVE_URL", "/")  # "back to live" link
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")  # optional ?token=...
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # download gate; empty = open
 
 FILE_RE = re.compile(r"^vod_(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})\.mp4$")
+
+# ---------------------------------------------------- auth helpers ----------
+def _hash(pw: str) -> str:
+    """SHA-256 hex of the password (compare tokens server-side, never raw PW)."""
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+# A random 32-byte secret minted per-process to sign session tokens.
+_SESSION_SECRET = secrets.token_hex(32)
+
+def _make_token() -> str:
+    sig = hmac.new(_SESSION_SECRET.encode(), b"admin", "sha256").hexdigest()
+    return f"admin:{sig}"
+
+def _valid_token(tok: str) -> bool:
+    if not tok:
+        return False
+    try:
+        expected = _make_token()
+        return hmac.compare_digest(tok, expected)
+    except Exception:
+        return False
+
+def _download_allowed(handler) -> bool:
+    """Return True if the request carries a valid session cookie or no password is set."""
+    if not ADMIN_PASSWORD:
+        return True
+    cookies = handler.headers.get("Cookie", "")
+    for part in cookies.split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == "vod_admin" and _valid_token(v.strip()):
+            return True
+    return False
 
 
 def log(*a):
@@ -180,34 +217,88 @@ h1{{font-size:1.3rem}} video{{width:100%;background:#000;border-radius:8px;displ
 .v{{display:flex;justify-content:space-between;align-items:center;padding:10px;border-radius:6px;cursor:pointer}}
 .v:hover{{background:#222}} .live{{color:#f55;font-weight:600;margin-left:6px}}
 a{{color:#8ab4f8}} small{{color:#888}}
+/* login modal */
+#modal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);align-items:center;justify-content:center;z-index:99}}
+#modal.open{{display:flex}}
+#mbox{{background:#1e1e1e;padding:24px;border-radius:10px;min-width:260px;text-align:center}}
+#mbox h2{{margin:0 0 16px;font-size:1rem}} #mbox input{{width:100%;padding:8px;border:1px solid #444;border-radius:6px;background:#111;color:#eee;font-size:1rem;box-sizing:border-box}}
+#mbox button{{margin-top:12px;width:100%;padding:9px;background:#8ab4f8;color:#000;border:0;border-radius:6px;font-size:1rem;cursor:pointer;font-weight:600}}
+#merr{{color:#f55;font-size:.85rem;margin-top:8px;min-height:1em}}
 </style></head><body>
 <h1>{title}</h1><p><a href="{live}">← back to live</a></p><video id="p" controls playsinline></video>
 {rows}
+{login_modal}
 <script>
 document.querySelectorAll('.v').forEach(r=>r.onclick=e=>{{
- if(e.target.tagName==='A')return;const p=document.getElementById('p');
+ if(e.target.tagName==='A'||e.target.closest('button'))return;const p=document.getElementById('p');
  p.style.display='block';p.src='/vods/'+r.dataset.f;p.play();scrollTo(0,0);}});
+{login_js}
 </script></body></html>"""
 
+LOGIN_MODAL = """<div id="modal"><div id="mbox">
+<h2>Admin login to download</h2>
+<input id="mpw" type="password" placeholder="Password" autocomplete="current-password">
+<button onclick="doLogin()">Login</button>
+<div id="merr"></div>
+</div></div>"""
 
-def render_page():
+LOGIN_JS = """
+var _dlFile=null;
+function openLogin(f){_dlFile=f;document.getElementById('modal').classList.add('open');
+  setTimeout(()=>document.getElementById('mpw').focus(),50);}
+document.getElementById('modal').onclick=function(e){if(e.target===this)this.classList.remove('open');};
+document.getElementById('mpw').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
+function doLogin(){
+  var pw=document.getElementById('mpw').value;
+  fetch('/vods/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})})
+  .then(r=>r.json()).then(d=>{
+    if(d.ok){document.getElementById('modal').classList.remove('open');
+              document.getElementById('mpw').value='';
+              if(_dlFile){var a=document.createElement('a');a.href='/vods/download/'+_dlFile;a.download=_dlFile;a.click();}
+    }else{document.getElementById('merr').textContent='Wrong password.';}
+  });
+}"""
+
+OPEN_DOWNLOAD_JS = ""  # no modal needed when downloads are open
+
+
+def render_page(authed: bool = False):
+    """authed=True means the request already has a valid admin cookie."""
     vods = list_vods()
     if not vods:
         rows = "<p>No VODs yet.</p>"
     else:
         rows, day = [], None
+        gate = ADMIN_PASSWORD != ""
         for v in vods:
             if v["date"] != day:
                 day = v["date"]
                 rows.append(f'<div class="day">{day}</div>')
             f = html.escape(v["name"])
             live = '<span class="live">● recording</span>' if v.get("recording") else ""
+            if gate and not authed:
+                dl = f'<button style="background:none;border:none;cursor:pointer;color:#8ab4f8;font-size:.9rem" onclick="openLogin(\'{f}\')">🔒 download</button>'
+            else:
+                dl = f'<a href="/vods/download/{f}" download>download</a>'
             rows.append(
                 f'<div class="v" data-f="{f}"><span>▶ {v["start"]}{live}</span>'
-                f'<span><small>{human(v["size"])}</small> &nbsp;'
-                f'<a href="/vods/{f}" download>download</a></span></div>')
+                f'<span><small>{human(v["size"])}</small> &nbsp;{dl}</span></div>')
         rows = "\n".join(rows)
-    return PAGE.format(title=html.escape(TITLE), live=html.escape(LIVE_URL, quote=True), rows=rows).encode()
+
+    if ADMIN_PASSWORD and not authed:
+        modal = LOGIN_MODAL
+        js = LOGIN_JS
+    else:
+        modal = ""
+        js = OPEN_DOWNLOAD_JS
+
+    return PAGE.format(
+        title=html.escape(TITLE),
+        live=html.escape(LIVE_URL, quote=True),
+        rows=rows,
+        login_modal=modal,
+        login_js=js,
+    ).encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -231,18 +322,49 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/vods", "/vods/"):
-            return self._send(200, render_page(), "text/html; charset=utf-8")
+            authed = _download_allowed(self)
+            return self._send(200, render_page(authed), "text/html; charset=utf-8")
         if path in ("/", ""):
             return self._send(302, extra={"Location": "/vods"})
         if path == "/vods/api/list":
             return self._send(200, json.dumps(list_vods()).encode(), "application/json")
+        # /vods/download/<name>  — gated download (triggers Content-Disposition)
+        if path.startswith("/vods/download/"):
+            if not _download_allowed(self):
+                return self._send(403, b"login required")
+            name = urllib.parse.unquote(path[len("/vods/download/"):])
+            return self.serve_file(name, download=True)
+        # /vods/<name>  — streaming (always allowed; browser can play without auth)
         if path.startswith("/vods/"):
             return self.serve_file(urllib.parse.unquote(path[6:]))
         self._send(404, b"not found")
 
     def do_POST(self):
-        """Owncast webhook endpoint: STREAM_STARTED / STREAM_STOPPED."""
         u = urllib.parse.urlparse(self.path)
+        # ---- Admin login ----
+        if u.path == "/vods/login":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+                pw = body.get("password", "")
+            except (ValueError, AttributeError):
+                pw = ""
+            if ADMIN_PASSWORD and hmac.compare_digest(_hash(pw), _hash(ADMIN_PASSWORD)):
+                token = _make_token()
+                resp = json.dumps({"ok": True}).encode()
+                # HttpOnly so JS can't steal it; SameSite=Strict; no Secure flag
+                # (the reverse proxy handles HTTPS termination)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.send_header("Set-Cookie",
+                    f"vod_admin={token}; Path=/vods; HttpOnly; SameSite=Strict; Max-Age=86400")
+                self.end_headers()
+                self.wfile.write(resp)
+            else:
+                self._send(401, json.dumps({"ok": False}).encode(), "application/json")
+            return
+        # ---- Owncast webhook: STREAM_STARTED / STREAM_STOPPED ----
         if u.path not in ("/webhook", "/vods/webhook"):
             return self._send(404, b"not found")
         if WEBHOOK_TOKEN and urllib.parse.parse_qs(u.query).get("token", [""])[0] != WEBHOOK_TOKEN:
@@ -257,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
             rec.wake.set()  # re-check status now instead of waiting for poll
         self._send(200, b"ok")
 
-    def serve_file(self, name):
+    def serve_file(self, name, download=False):
         if not FILE_RE.match(name):
             return self._send(404, b"not found")
         p = VOD_DIR / name
@@ -282,6 +404,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         self.send_header("Access-Control-Allow-Origin", "*")
+        if download:
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
         if m:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
