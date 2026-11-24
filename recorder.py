@@ -54,6 +54,9 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # download gate; empty = 
 CLOUD_URL = os.environ.get("CLOUD_URL", "").rstrip("/")  # e.g. http://127.0.0.1:8091
 # Comments under VODs, signed with the viewer's Owncast chat name.
 COMMENTS = os.environ.get("COMMENTS", "1") not in ("0", "false", "no", "")
+# Extra header links, "Label|URL" pairs separated by commas,
+# e.g. NAV_LINKS="Games|https://games.example.com"
+NAV_LINKS = [tuple(p.split("|", 1)) for p in os.environ.get("NAV_LINKS", "").split(",") if "|" in p]
 
 # ---- Thumbnails ----
 # Set to "" to disable thumbnail generation.
@@ -378,6 +381,7 @@ class Recorder:
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.online = False  # last polled stream status
+        self.stream_title = ""  # Owncast stream title at the last poll
 
     @property
     def running(self):
@@ -386,7 +390,9 @@ class Recorder:
     def stream_online(self):
         try:
             with urllib.request.urlopen(OWNCAST_URL + "/api/status", timeout=10) as r:
-                return bool(json.load(r).get("online"))
+                status = json.load(r)
+            self.stream_title = str(status.get("streamTitle") or "")
+            return bool(status.get("online"))
         except Exception as e:
             log("status check failed:", e)
             return False
@@ -451,6 +457,9 @@ class Recorder:
             for v in vods:
                 name = v["name"]
                 if v.get("recording"):
+                    # Remember the stream title the VOD started with.
+                    if self.stream_title and name not in load_titles():
+                        save_title(name, self.stream_title)
                     continue
                 if not v["thumb"] and name not in thumb_tried:
                     thumb_tried.add(name)
@@ -492,6 +501,38 @@ def save_seen(seen: set):
         tmp.replace(SEEN_FILE)
     except OSError as e:
         log("could not save", SEEN_FILE.name, e)
+
+
+# Stream title per VOD, in one file so it outlives the local copy (cloud VODs).
+TITLES_FILE = VOD_DIR / ".titles.json"
+_titles = None
+
+
+def load_titles() -> dict:
+    global _titles
+    if _titles is None:
+        try:
+            data = json.loads(TITLES_FILE.read_text())
+            _titles = data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            _titles = {}
+        except (OSError, ValueError) as e:
+            log("could not read", TITLES_FILE.name, e)
+            _titles = {}
+    return _titles
+
+
+def save_title(name: str, title: str):
+    titles = load_titles()
+    titles[name] = title[:200]
+    for old in sorted(titles)[:-1000]:  # keep the newest 1000
+        del titles[old]
+    tmp = TITLES_FILE.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(titles))
+        tmp.replace(TITLES_FILE)
+    except OSError as e:
+        log("could not save", TITLES_FILE.name, e)
 
 
 # --------------------------------------------------------------- storage ----
@@ -750,154 +791,307 @@ def vod_exists(name: str) -> bool:
 
 
 # ------------------------------------------------------------------ http ----
-PAGE = """<!doctype html><html><head><meta charset="utf-8">
+_oc_info = {"t": 0.0, "d": {}}
+
+
+def owncast_info() -> dict:
+    """Owncast's public name and tags (for the page header), cached 5 minutes."""
+    if time.time() - _oc_info["t"] > 300:
+        try:
+            with urllib.request.urlopen(OWNCAST_URL + "/api/config", timeout=3) as r:
+                d = json.load(r)
+            _oc_info["d"] = {"name": str(d.get("name") or ""),
+                             "tags": [str(t) for t in (d.get("tags") or [])][:8]}
+        except Exception as e:
+            log("owncast config failed:", e)
+        _oc_info["t"] = time.time()
+    return _oc_info["d"]
+
+
+def _fill(tpl: str, **kw) -> str:
+    """Replace %%KEY%% markers in one pass (inserted values are not re-scanned)."""
+    return re.sub(r"%%(\w+)%%", lambda m: kw[m.group(1)], tpl)
+
+
+PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title><style>
-:root{{--bg:#0e0f13;--card:#171922;--card2:#1e212c;--line:#262a37;--text:#ececf1;--muted:#8d91a5;--gold:#f2b544;--red:#ff4d5e}}
-*{{box-sizing:border-box}}
-body{{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);margin:0 auto;padding:24px 20px 40px;max-width:1200px;-webkit-font-smoothing:antialiased}}
-a{{color:var(--gold);text-decoration:none}} a:hover{{text-decoration:underline}}
-.top{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px;flex-wrap:wrap}}
-.top h1{{margin:0;font-size:1.6rem;font-weight:800;letter-spacing:-.02em}}
-.top .sub{{color:var(--muted);font-size:.9rem;margin-top:2px}}
-/* player */
-#stage{{display:none;background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:28px;box-shadow:0 10px 30px rgba(0,0,0,.35)}}
-#stage.on{{display:block}}
-video{{width:100%;display:block;background:#000;aspect-ratio:16/9}}
-.np{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line)}}
-.np-k{{color:var(--gold);font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase}}
-#nptitle{{font-weight:700;font-size:1.05rem;margin-top:2px}}
-#npclose{{background:none;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:6px 10px;cursor:pointer;font:inherit;font-size:.85rem}}
-#npclose:hover{{color:var(--text);border-color:var(--muted)}}
-/* list */
-.day{{display:flex;align-items:center;gap:12px;margin:26px 0 12px;color:var(--muted);font-size:.78rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase}}
-.day::after{{content:"";flex:1;height:1px;background:var(--line)}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:18px}}
-.v{{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s}}
-.v:hover{{transform:translateY(-3px);border-color:#3a3f52;box-shadow:0 8px 22px rgba(0,0,0,.4)}}
-.v.active{{border-color:var(--gold);box-shadow:0 0 0 1px var(--gold)}}
-.tw{{position:relative;aspect-ratio:16/9;background:linear-gradient(135deg,#1c1f2a,#11131a)}}
-.thumb{{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}}
-.thumb-ph{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#3a3f52;font-size:2.2rem}}
-.play{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.35);opacity:0;transition:opacity .15s}}
-.play span{{width:54px;height:54px;border-radius:50%;background:var(--gold);color:#111;display:flex;align-items:center;justify-content:center;font-size:1.3rem;padding-left:4px;box-shadow:0 4px 14px rgba(0,0,0,.5)}}
-.v:hover .play{{opacity:1}}
-.dur{{position:absolute;right:8px;bottom:8px;background:rgba(0,0,0,.8);color:#fff;font-size:.75rem;font-weight:600;padding:2px 6px;border-radius:4px;font-variant-numeric:tabular-nums}}
-.badge{{position:absolute;left:8px;top:8px;font-size:.68rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase;padding:3px 7px;border-radius:4px}}
-.live{{background:var(--red);color:#fff;animation:pulse 1.6s infinite}}
-.cloud{{background:rgba(0,0,0,.7);color:#cfd6ff}}
-@keyframes pulse{{50%{{opacity:.6}}}}
-.vb{{display:flex;align-items:flex-start;gap:8px;padding:12px 14px 14px}}
-.vinfo{{flex:1;min-width:0}}
-.vtitle{{font-weight:700;font-size:.95rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-.vmeta{{color:var(--muted);font-size:.8rem;margin-top:4px}}
-.dl{{flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:8px;border:1px solid var(--line);background:none;color:var(--muted);cursor:pointer;font-size:.95rem;text-decoration:none}}
-.dl:hover{{color:var(--gold);border-color:var(--gold);text-decoration:none}}
-.empty{{text-align:center;padding:60px 20px;color:var(--muted);background:var(--card);border:1px dashed var(--line);border-radius:14px}}
-.empty b{{display:block;color:var(--text);font-size:1.05rem;margin-bottom:4px}}
+<title>%%TITLE%%</title><style>
+:root{--bg:#0b1020;--panel:#121a2e;--panel2:#18223b;--line:#243150;--text:#eef1f8;--mute:#93a0bd;--dim:#5f6b88;
+  --gold:#ffc857;--coral:#ff7a59;--red:#e5383b;--grad:linear-gradient(135deg,var(--gold),var(--coral))}
+*{box-sizing:border-box}
+html{color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}
+button{font:inherit;color:inherit}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;font-weight:700;font-size:14px;border:1px solid transparent;cursor:pointer;white-space:nowrap}
+.btn.primary{background:var(--grad);color:#1a1206}
+.btn.ghost{background:var(--panel2);color:var(--text);border-color:var(--line)}
+.btn.ghost:hover{border-color:#ffc85766}
+.btn:disabled{opacity:.55;cursor:default}
+.chip{display:inline-block;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:700;letter-spacing:.4px;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);color:#fff}
+.chip.gold{background:var(--grad);color:#1a1206}
+.chip.rec{background:var(--red);animation:pulse 1.6s infinite}
+@keyframes pulse{50%{opacity:.65}}
+/* header (matches the Owncast live page) */
+header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:14px;padding:10px 22px;background:rgba(11,16,32,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+header .logo{display:block;width:42px;height:42px;border-radius:10px;box-shadow:0 0 0 2px #ffc85755;object-fit:cover}
+.brand b{display:block;font-size:17px;letter-spacing:.2px;line-height:1.2}
+.brand span{font-size:12px;color:var(--mute)}
+.status{display:inline-flex;align-items:center;gap:6px;margin-left:8px;padding:3px 10px;border-radius:99px;background:#1d2742;color:var(--mute);font-size:12px;font-weight:600}
+.status i{width:8px;height:8px;border-radius:50%;background:#5b6785}
+.status.live{background:#e5383b26;color:#ff8a8c}
+.status.live i{background:var(--red);animation:pulse 1.6s infinite}
+nav{margin-left:auto;display:flex;gap:6px}
+nav a{padding:8px 14px;border-radius:8px;color:var(--mute);font-weight:600;font-size:14px}
+nav a:hover{color:var(--text)}
+nav a.on{color:var(--text);background:var(--panel2)}
+/* stage: player + comments column */
+.stage{display:grid;grid-template-columns:minmax(0,1fr) 360px;border-bottom:1px solid var(--line);background:#070b16}
+.stage.solo{grid-template-columns:minmax(0,1fr)}
+.pcol{min-width:0}
+.player{position:relative;aspect-ratio:16/9;background:#000;overflow:hidden}
+.player .bg{position:absolute;inset:-40px;background:center/cover;filter:blur(30px) brightness(.5)}
+.player video{position:relative;width:100%;height:100%;display:block;background:transparent}
+.ov{position:absolute;top:16px;left:16px;display:flex;gap:8px;pointer-events:none;transition:opacity .3s}
+.bigplay{position:absolute;inset:0;margin:auto;width:84px;height:84px;border-radius:50%;background:rgba(0,0,0,.5);border:2px solid #fff8;color:#fff;display:grid;place-items:center;font-size:32px;padding-left:6px;cursor:pointer;transition:opacity .3s,transform .15s,border-color .15s}
+.bigplay:hover{transform:scale(1.06);border-color:var(--gold)}
+.playing .ov,.playing .bigplay{opacity:0;pointer-events:none}
+.moments{position:relative;height:6px;background:#1a2440;cursor:pointer}
+.moments b{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--grad);pointer-events:none}
+.moments i{position:absolute;top:-3px;width:3px;height:12px;margin-left:-1px;border-radius:2px;background:#fff;opacity:.85}
+.moments i:hover{background:var(--gold);opacity:1}
+.side{position:relative;background:var(--panel);border-left:1px solid var(--line)}
+.side-in{position:absolute;inset:0;display:flex;flex-direction:column}
+.side h3{margin:0;padding:14px 16px;font-size:13px;letter-spacing:.6px;text-transform:uppercase;color:var(--mute);border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
+.side h3 em{font-style:normal;color:var(--gold)}
+#clist{flex:1;overflow:auto;padding:8px 6px}
+.m{position:relative;padding:8px 26px 8px 10px;border-radius:8px}
+.m:hover{background:var(--panel2)}
+.m .t{display:inline-block;margin-right:6px;padding:0 6px;border-radius:4px;background:#ffc85722;color:var(--gold);font:600 12px/18px ui-monospace,Consolas,monospace;cursor:pointer}
+.m .t:hover{background:#ffc85744}
+.m .who{font-weight:700;font-size:14px}
+.m .mod{font-size:10px;font-weight:800;padding:1px 5px;border-radius:4px;background:#3b82f633;color:#8ab4ff;margin-left:5px;vertical-align:2px}
+.m p{margin:2px 0 0;color:#d6dbea;font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere}
+.m .del{position:absolute;right:6px;top:6px;background:none;border:0;color:var(--dim);cursor:pointer;opacity:0;font-size:13px}
+.m:hover .del{opacity:1}
+.m .del:hover{color:#ff8a8c}
+.cempty{color:var(--mute);font-size:14px;text-align:center;padding:30px 14px}
+.compose{padding:12px;border-top:1px solid var(--line)}
+.compose .as{font-size:12px;color:var(--mute);margin-bottom:6px}
+.compose .as b{color:#7ee0b5}
+.field{display:flex;gap:8px;align-items:flex-end;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:6px 6px 6px 12px}
+.field:focus-within{border-color:#ffc85799}
+#ctext{flex:1;height:32px;max-height:120px;padding:6px 0;border:0;background:none;color:var(--text);font:inherit;font-size:14px;resize:none;outline:none}
+.field .btn{padding:6px 14px;font-size:13px}
+#cmsg{font-size:12px;color:var(--mute);margin-top:6px}
+#cmsg:empty{display:none}
+/* title / info row under the player */
+.info{display:flex;gap:18px;align-items:flex-start;padding:18px 22px;border-bottom:1px solid var(--line)}
+.info .logo{width:64px;height:64px;border-radius:14px;object-fit:cover;flex-shrink:0}
+.info .txt{min-width:0}
+.info h1{margin:0;font-size:21px;line-height:1.3}
+.meta{color:var(--mute);font-size:14px;margin-top:3px}
+.tags{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}
+.tag{padding:3px 10px;border-radius:99px;background:var(--panel2);border:1px solid var(--line);font-size:12px;color:#c6cde0}
+.acts{margin-left:auto;display:flex;gap:8px;flex-shrink:0}
+/* VODs grid */
+main{padding:6px 22px 40px;max-width:1500px;margin:0 auto}
+.sec{display:flex;align-items:baseline;gap:12px;margin:26px 0 4px;flex-wrap:wrap}
+.sec h2{margin:0;font-size:18px}
+.sec span{color:var(--mute);font-size:13px}
+.filters{margin-left:auto;display:flex;gap:6px}
+.filters button{padding:5px 12px;border-radius:99px;font-size:13px;font-weight:600;color:var(--mute);border:1px solid var(--line);background:none;cursor:pointer}
+.filters button:hover{color:var(--text)}
+.filters button.on{color:#1a1206;background:var(--grad);border-color:transparent}
+.day{margin:22px 0 12px;font-size:15px;font-weight:700;color:var(--mute)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:18px}
+.card{display:block;border-radius:12px;overflow:hidden;background:var(--panel);border:1px solid var(--line);cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s}
+.card:hover{transform:translateY(-3px);border-color:#ffc85766;box-shadow:0 10px 30px #0008}
+.card.now{outline:2px solid var(--gold);outline-offset:2px}
+.th{position:relative;aspect-ratio:16/9;background:linear-gradient(135deg,#1c2744,#0d1324)}
+.th img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.th .ph{position:absolute;inset:0;display:grid;place-items:center;color:#2c3a5e;font-size:34px}
+.th .dur{position:absolute;right:8px;bottom:8px;padding:2px 7px;border-radius:5px;background:rgba(0,0,0,.8);font:600 12px ui-monospace,Consolas,monospace;color:#fff}
+.th .chip{position:absolute;left:8px;top:8px}
+.th .np,.card.now .th .other{display:none}
+.card.now .th .np{display:inline-block}
+.th .prog{position:absolute;left:0;bottom:0;height:3px;background:var(--grad)}
+.cb{padding:11px 13px 13px}
+.cb b{display:block;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cb .row{display:flex;justify-content:space-between;gap:8px;color:var(--mute);font-size:13px;margin-top:3px}
+.cb .row .c{color:#c6cde0}
+.empty{text-align:center;padding:70px 20px;color:var(--mute)}
+.empty b{display:block;color:var(--text);font-size:18px;margin-bottom:6px}
+footer{color:var(--dim);font-size:12px;text-align:center;padding:20px}
+footer a{color:var(--mute)}
+footer a:hover{color:var(--gold)}
 /* login modal */
-#modal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);align-items:center;justify-content:center;z-index:99}}
-#modal.open{{display:flex}}
-#mbox{{background:var(--card);border:1px solid var(--line);padding:24px;border-radius:14px;min-width:280px;text-align:center}}
-#mbox h2{{margin:0 0 16px;font-size:1rem}}
-#mbox input{{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font-size:1rem}}
-#mbox button{{margin-top:12px;width:100%;padding:10px;background:var(--gold);color:#111;border:0;border-radius:8px;font-size:1rem;cursor:pointer;font-weight:700}}
-#merr{{color:var(--red);font-size:.85rem;margin-top:8px;min-height:1em}}
-/* comments */
-#cbox{{display:none;padding:16px 18px 18px}}
-#cbox h2{{margin:0 0 10px;font-size:.95rem}}
-.c{{padding:10px 0;border-bottom:1px solid var(--line)}}
-.c:last-child{{border-bottom:0}}
-.cn{{font-weight:700;margin-right:8px}}
-.ct,.cpos{{color:var(--muted);font-size:.78rem;margin-right:8px}}
-.cpos{{cursor:pointer;color:var(--gold);font-weight:600;font-variant-numeric:tabular-nums}}
-.cdel{{background:none;border:0;color:var(--muted);cursor:pointer;font-size:.78rem;float:right}}
-.cdel:hover{{color:var(--red)}}
-.cx{{white-space:pre-wrap;word-wrap:break-word;margin-top:3px;line-height:1.45}}
-#ctext{{width:100%;min-height:70px;margin-top:12px;padding:10px 12px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:10px;font:inherit;resize:vertical}}
-#ctext:focus{{outline:none;border-color:var(--gold)}}
-#cpost{{margin-top:8px;padding:8px 18px;background:var(--gold);color:#111;border:0;border-radius:8px;font-weight:700;cursor:pointer;font:inherit;font-weight:700}}
-#cpost:disabled{{opacity:.6}}
-#cmsg{{color:var(--muted);font-size:.85rem;margin-top:8px}}
-@media (max-width:520px){{body{{padding:16px 12px 32px}}.grid{{grid-template-columns:1fr 1fr;gap:12px}}.vb{{padding:10px}}.vtitle{{font-size:.85rem}}.dl{{display:none}}}}
-{embed_css}
-</style></head><body>
-{header}
-<div id="stage"><video id="p" controls playsinline></video>
-<div class="np"><div><div class="np-k">Now playing</div><div id="nptitle"></div></div>
-<button id="npclose" type="button">✕ Close</button></div>
-{comments_box}</div>
-{rows}
-{login_modal}
+#modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);align-items:center;justify-content:center;z-index:99}
+#modal.open{display:flex}
+#mbox{background:var(--panel);border:1px solid var(--line);padding:24px;border-radius:14px;width:300px;text-align:center}
+#mbox h2{margin:0 0 16px;font-size:16px}
+#mbox input{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font-size:15px}
+#mbox button{margin-top:12px;width:100%;padding:10px;background:var(--grad);color:#1a1206;border:0;border-radius:8px;font-size:15px;cursor:pointer;font-weight:700}
+#merr{color:#ff8a8c;font-size:13px;margin-top:8px;min-height:1em}
+/* ?embed=1: inside an iframe on the Owncast page, no header or footer */
+.embed{background:transparent}
+.embed .stage{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.embed .info{padding:16px 2px}
+.embed main{padding:0 2px 16px;max-width:none}
+nav a{white-space:nowrap}
+@media (max-width:980px){.stage{grid-template-columns:minmax(0,1fr)}.side{border-left:0;border-top:1px solid var(--line);height:420px}}
+@media (max-width:1200px){.embed .stage{grid-template-columns:minmax(0,1fr)}.embed .side{border-left:0;border-top:1px solid var(--line);height:420px}}
+@media (max-width:640px){header{padding:8px 12px;gap:10px}.brand span,.status,header .btn,nav a[target]{display:none}nav a{padding:6px 10px}
+  .info{padding:14px 12px;flex-wrap:wrap}.info .logo{display:none}.acts{margin-left:0}
+  main{padding:4px 12px 30px}.grid{grid-template-columns:1fr 1fr;gap:12px}.cb{padding:9px 10px 10px}.cb b{font-size:13px}
+  .filters{margin-left:0}.bigplay{width:60px;height:60px;font-size:24px}}
+</style></head><body class="%%BODY_CLASS%%">
+%%HEADER%%
+%%STAGE%%
+<main>
+<div class="sec"><h2>VODs</h2><span>%%COUNT%%</span><div class="filters">%%FILTERS%%</div></div>
+%%ROWS%%
+</main>
+%%FOOTER%%
+%%LOGIN_MODAL%%
 <script>
-var _stage=document.getElementById('stage'),_p=document.getElementById('p');
-document.querySelectorAll('.v').forEach(r=>r.onclick=e=>{{
-  if(e.target.tagName==='A'||e.target.closest('button'))return;
-  var src=r.dataset.f,th=r.dataset.th||'';
-  _stage.classList.add('on');
-  document.querySelectorAll('.v.active').forEach(x=>x.classList.remove('active'));r.classList.add('active');
-  document.getElementById('nptitle').textContent=r.dataset.t||'';
-  if(th)_p.poster=th; else _p.removeAttribute('poster');
-  _p.src=src;_p.play();scrollTo({{top:0,behavior:'smooth'}});
-  if(window.loadComments)loadComments(r.dataset.n);
-}});
-document.getElementById('npclose').onclick=function(){{
-  _p.pause();_p.removeAttribute('src');_p.load();_stage.classList.remove('on');
-  document.querySelectorAll('.v.active').forEach(x=>x.classList.remove('active'));
-}};
-{login_js}
-{comments_js}
+var VODS=%%DATA%%,GATED=%%GATED%%;
+%%PAGE_JS%%
+%%LOGIN_JS%%
+%%COMMENTS_JS%%
 </script></body></html>"""
 
-COMMENTS_BOX = """<div id="cbox"><h2>Comments</h2><div id="clist"></div>
-<div id="cform"><textarea id="ctext" maxlength="500" placeholder="Add a comment as your chat name…"></textarea>
-<button id="cpost">Post</button></div><div id="cmsg"></div></div>"""
+STAGE = """<section class="stage%%SOLO%%" id="stage"><div class="pcol">
+<div class="player"><div class="bg" id="pbg"></div>
+<video id="p" controls playsinline preload="metadata"></video>
+<div class="ov"><span class="chip gold" id="pkind">VOD</span><span class="chip" id="pwhen"></span></div>
+<button class="bigplay" id="bigplay" type="button" aria-label="Play">▶</button></div>
+<div class="moments" id="moments" title="Click to jump"><b id="mprog"></b></div>
+</div>%%SIDE%%</section>
+<section class="info"><img class="logo" src="%%LOGO%%" alt="" onerror="this.remove()">
+<div class="txt"><h1 id="vtitle"></h1><div class="meta" id="vmeta"></div>%%TAGS%%</div>
+<div class="acts"><button class="btn ghost" id="share" type="button">⤴ Share</button>
+<button class="btn ghost" id="dl" type="button">%%DL_LABEL%%</button></div></section>"""
+
+PAGE_JS = """
+var $=function(id){return document.getElementById(id)};
+var P=$('p'),cur=null,lastSave=0;
+function fmt(s){s=Math.floor(s);var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0');}
+function saved(n){try{return +localStorage.getItem('vodpos:'+n)||0}catch(e){return 0}}
+function save(n,t){try{if(t>30)localStorage.setItem('vodpos:'+n,Math.floor(t));else localStorage.removeItem('vodpos:'+n)}catch(e){}}
+function cards(){return document.querySelectorAll('.card')}
+function dur(){return isFinite(P.duration)&&P.duration>0?P.duration:(cur&&cur.dur)||0}
+function cardProg(c){var v=VODS[c.dataset.i],t=v===cur&&P.currentTime?P.currentTime:saved(v.n),
+  d=v===cur?dur():v.dur;c.querySelector('.prog').style.width=d&&t?Math.min(100,t/d*100)+'%':'0'}
+function seek(t){P.currentTime=t;P.play().catch(function(){})}
+function drawMarks(){var m=$('moments'),d=dur();m.querySelectorAll('i').forEach(function(x){x.remove()});
+  if(!d)return;(window.MARKS||[]).forEach(function(c){if(c.pos==null||c.pos>d)return;
+    var i=document.createElement('i');i.style.left=c.pos/d*100+'%';i.title=fmt(c.pos)+'  '+c.name+': '+c.text;
+    i.onclick=function(e){e.stopPropagation();seek(c.pos)};m.appendChild(i)})}
+function select(i,play,t,quiet){var v=VODS[i];if(!v)return;
+  if(cur&&P.currentTime)save(cur.n,P.currentTime);
+  cur=v;$('stage').classList.remove('playing');
+  $('pbg').style.backgroundImage=v.th?'url('+v.th+')':'';
+  if(v.th)P.poster=v.th;else P.removeAttribute('poster');
+  $('pkind').textContent=v.rec?'\\u25cf RECORDING':'VOD';$('pkind').className='chip '+(v.rec?'rec':'gold');
+  $('pwhen').textContent=v.when;$('vtitle').textContent=v.title;$('vmeta').textContent=v.meta;
+  var start=t!=null?t:saved(v.n);
+  P.onloadedmetadata=function(){if(start>0&&(!isFinite(P.duration)||start<P.duration-20))P.currentTime=start;drawMarks()};
+  P.src=v.src;
+  cards().forEach(function(c){c.classList.toggle('now',+c.dataset.i===i);cardProg(c)});
+  if(!quiet){var q=new URLSearchParams(location.search);q.set('v',v.n);q.delete('t');history.replaceState(null,'','?'+q)}
+  if(play)P.play().catch(function(){});
+  if(window.loadComments)loadComments(v.n);}
+P.addEventListener('play',function(){$('stage').classList.add('playing')});
+P.addEventListener('pause',function(){$('stage').classList.remove('playing');if(cur)save(cur.n,P.currentTime)});
+P.addEventListener('ended',function(){if(cur)save(cur.n,0)});
+P.addEventListener('timeupdate',function(){if(!cur)return;var d=dur();
+  $('mprog').style.width=d?Math.min(100,P.currentTime/d*100)+'%':'0';
+  var c=document.querySelector('.card.now');if(c)cardProg(c);
+  if(Date.now()-lastSave>5000){lastSave=Date.now();save(cur.n,P.currentTime)}
+  if(window.onTime)onTime();});
+$('bigplay').onclick=function(){P.play().catch(function(){})};
+$('moments').onclick=function(e){var d=dur(),r=this.getBoundingClientRect();if(d)seek((e.clientX-r.left)/r.width*d)};
+$('share').onclick=function(){if(!cur)return;var b=this,
+  u=location.origin+'/vods?v='+encodeURIComponent(cur.n)+(P.currentTime>5?'&t='+Math.floor(P.currentTime):'');
+  function done(){b.textContent='\\u2713 Link copied';setTimeout(function(){b.textContent='\\u2934 Share'},2000)}
+  if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(u).then(done,function(){prompt('Copy this link:',u)});
+  else prompt('Copy this link:',u);};
+$('dl').onclick=function(){if(!cur)return;if(GATED)return openLogin(cur.n,cur.cloud);
+  var a=document.createElement('a');a.href=cur.dl;a.download=cur.n;document.body.appendChild(a);a.click();a.remove();};
+cards().forEach(function(c){cardProg(c);c.onclick=function(e){if(e.ctrlKey||e.metaKey||e.shiftKey||e.button)return;
+  e.preventDefault();select(+c.dataset.i,true);scrollTo({top:0,behavior:'smooth'})}});
+document.querySelectorAll('.filters button').forEach(function(b){b.onclick=function(){var f=b.dataset.f;
+  document.querySelectorAll('.filters button').forEach(function(x){x.classList.toggle('on',x===b)});
+  cards().forEach(function(c){c.style.display=!f||c.dataset[f]?'':'none'});
+  document.querySelectorAll('.grid').forEach(function(g){var any=[].some.call(g.children,function(c){return c.style.display!=='none'});
+    g.style.display=g.previousElementSibling.style.display=any?'':'none'})}});
+// After the rest of the script (comments code) has set itself up.
+document.addEventListener('DOMContentLoaded',function(){var q=new URLSearchParams(location.search),t=parseFloat(q.get('t')),
+  i=VODS.findIndex(function(v){return v.n===q.get('v')});
+  if(i<0){i=Math.max(0,VODS.findIndex(function(v){return !v.rec}));t=NaN}
+  select(i,false,isNaN(t)?null:t,true);});
+"""
+
+COMMENTS_SIDE = """<aside class="side"><div class="side-in">
+<h3>Comments <em id="ccount"></em></h3><div id="clist"></div>
+<div class="compose"><div id="cform"><div class="as" id="cas"></div>
+<div class="field"><textarea id="ctext" rows="1" maxlength="500" placeholder="Say something about this moment…"></textarea>
+<button class="btn primary" id="cpost" type="button">Post</button></div></div><div id="cmsg"></div></div>
+</div></aside>"""
 
 COMMENTS_JS = """
-var _vod=null,_me=null,_admin=false;
+var _vod=null,_me=null,_admin=false,_open=true;
 var CERR={no_chat:'To comment, open the chat on the live page once so Owncast gives you a chat name, then come back.',
   banned:'You are banned from chat, so you can\\'t comment.',
   live:'Comments are closed while the stream is live. They reopen when it ends.',
   slow_down:'Slow down a little.',rate_limited:'Too many attempts. Try again later.',
   length:'Comments must be 1-500 characters.',full:'This VOD has reached its comment limit.',
   chat_unreachable:'Couldn\\'t reach chat to check your name. Try again later.'};
+var COLORS=['#ffc857','#7ee0b5','#c49bff','#ff9b85','#8ab4ff','#f78fb3','#9be15d','#5fd3f3'];
 function chatToken(){try{var t=localStorage.getItem('accessToken')||'';
   try{var j=JSON.parse(t);if(typeof j==='string')t=j;}catch(e){}
   return /^[A-Za-z0-9_+\\/=.-]+$/.test(t)?t:'';}catch(e){return '';}}
 function capi(url,body){var o={headers:{'X-Chat-Token':chatToken()},credentials:'same-origin'};
   if(body){o.method='POST';o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
-  return fetch(url,o).then(r=>r.json().then(d=>({status:r.status,d:d})));}
-function fmt(s){s=Math.floor(s);var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
-  return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0');}
+  return fetch(url,o).then(function(r){return r.json().then(function(d){return {status:r.status,d:d}})});}
 function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
-function cmsg(t){document.getElementById('cmsg').textContent=t||'';}
-function loadComments(name){_vod=name;document.getElementById('cbox').style.display='block';cmsg('');
-  document.getElementById('clist').textContent='Loading…';
+function cmsg(t){$('cmsg').textContent=t||'';}
+function onTime(){var a=$('cas');if(!_open)return;a.textContent='';
+  if(_me){a.appendChild(document.createTextNode('Commenting as '));a.appendChild(el('b',null,_me.name));}
+  else a.appendChild(document.createTextNode('Comments use your Owncast chat name'));
+  a.appendChild(document.createTextNode(' \\u00b7 at '+fmt(P.currentTime||0)));}
+function loadComments(name){_vod=name;cmsg('');window.MARKS=[];drawMarks();
+  var list=$('clist');list.textContent='';list.appendChild(el('div','cempty','Loading\\u2026'));$('ccount').textContent='';
   capi('/vods/api/comments?vod='+encodeURIComponent(name)).then(function(res){
-    if(name!==_vod)return;var d=res.d;_me=d.me||_me;_admin=!!d.admin;
-    document.getElementById('cform').style.display=d.open?'':'none';
-    if(!d.open)cmsg(CERR.live);
-    var list=document.getElementById('clist');list.textContent='';
-    if(!d.comments||!d.comments.length)list.appendChild(el('div','ct','No comments yet.'));
-    (d.comments||[]).forEach(function(c){
-      var row=el('div','c'),n=el('span','cn',c.name);
-      n.style.color='hsl('+((c.color||0)*47%360)+',70%,70%)';row.appendChild(n);
-      row.appendChild(el('span','ct',new Date(c.t*1000).toLocaleString()));
-      if(c.pos!=null){var a=el('span','cpos','@'+fmt(c.pos));
-        a.onclick=function(){var p=document.getElementById('p');p.currentTime=c.pos;p.play();scrollTo(0,0);};row.appendChild(a);}
-      if(_admin||(_me&&(_me.mod||_me.id===c.uid))){var b=el('button','cdel','delete');
+    if(name!==_vod)return;var d=res.d,items=d.comments||[];_me=d.me||_me;_admin=!!d.admin;_open=!!d.open;
+    $('cform').style.display=_open?'':'none';if(!_open)cmsg(CERR.live);onTime();
+    $('ccount').textContent=items.length;
+    var cc=document.querySelector('.card.now .c');if(cc)cc.textContent='\\ud83d\\udcac '+items.length;
+    items.sort(function(a,b){return (a.pos==null?1e9:a.pos)-(b.pos==null?1e9:b.pos)||a.t-b.t});
+    window.MARKS=items;drawMarks();list.textContent='';
+    if(!items.length)list.appendChild(el('div','cempty','No comments yet. Say something about this VOD.'));
+    items.forEach(function(c){var row=el('div','m');row.title=new Date(c.t*1000).toLocaleString();
+      if(c.pos!=null){var a=el('span','t',fmt(c.pos));a.title='Jump to '+fmt(c.pos);a.onclick=function(){seek(c.pos)};row.appendChild(a);}
+      var n=el('span','who',c.name);n.style.color=COLORS[Math.abs(c.color||0)%COLORS.length];row.appendChild(n);
+      if(c.mod)row.appendChild(el('span','mod','MOD'));
+      if(_admin||(_me&&(_me.mod||_me.id===c.uid))){var b=el('button','del','\\u2715');b.title='Delete';
         b.onclick=function(){if(confirm('Delete this comment?'))capi('/vods/api/comments/delete',{vod:_vod,id:c.id})
           .then(function(r){if(r.d.ok)loadComments(_vod);else cmsg(CERR[r.d.error]||'Could not delete.');});};row.appendChild(b);}
-      row.appendChild(el('div','cx',c.text));list.appendChild(row);});
-  }).catch(function(){document.getElementById('clist').textContent='Could not load comments.';});}
-document.getElementById('cpost').onclick=function(){
-  var t=document.getElementById('ctext'),p=document.getElementById('p'),btn=this;
-  if(!t.value.trim())return;btn.disabled=true;cmsg('Posting…');
-  capi('/vods/api/comments',{vod:_vod,text:t.value,pos:p.currentTime||null}).then(function(r){
+      row.appendChild(el('p',null,c.text));list.appendChild(row);});
+  }).catch(function(){list.textContent='';list.appendChild(el('div','cempty','Could not load comments.'));});}
+function postComment(){var t=$('ctext'),btn=$('cpost');
+  if(!t.value.trim()||btn.disabled)return;btn.disabled=true;cmsg('Posting\\u2026');
+  capi('/vods/api/comments',{vod:_vod,text:t.value,pos:P.currentTime||null}).then(function(r){
     btn.disabled=false;
-    if(r.d.ok){t.value='';_me=r.d.me;loadComments(_vod);}
+    if(r.d.ok){t.value='';t.style.height='';_me=r.d.me;loadComments(_vod);}
     else cmsg(CERR[r.d.error]||'Could not post.');
-  }).catch(function(){btn.disabled=false;cmsg('Could not post.');});};"""
+  }).catch(function(){btn.disabled=false;cmsg('Could not post.');});}
+$('cpost').onclick=postComment;
+$('ctext').addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();postComment();}});
+$('ctext').addEventListener('input',function(){this.style.height='';this.style.height=Math.min(this.scrollHeight,120)+'px';});
+"""
 
 LOGIN_MODAL = """<div id="modal"><div id="mbox">
 <h2>Admin login to download</h2>
@@ -927,12 +1121,6 @@ function doLogin(){
   }));
 }"""
 
-OPEN_DOWNLOAD_JS = ""  # no modal needed when downloads are open
-
-# ?embed=1: compact version for an iframe on the Owncast page (no title or
-# back link, no page background, fills the frame's width)
-EMBED_CSS = "body{background:transparent;padding:4px 2px 8px;max-width:none}.day:first-of-type{margin-top:4px}"
-
 
 def _vod_start(v) -> float:
     """Start time of a VOD (local time zone) from its file name."""
@@ -955,101 +1143,136 @@ def _clock(hhmm: str) -> str:
     return f'{(h % 12) or 12}:{m:02d} {"AM" if h < 12 else "PM"}'
 
 
-def _duration(v) -> str:
-    """Approximate length of a finished local VOD: last write minus start."""
+def _duration(v) -> int:
+    """Approximate length in seconds of a finished local VOD (last write minus
+    start), or 0 if unknown."""
     if v.get("recording") or not v.get("mtime"):
-        return ""
+        return 0
     s = int(v["mtime"] - _vod_start(v))
-    if not 0 < s < 2 * 86400:
-        return ""
+    return s if 0 < s < 2 * 86400 else 0
+
+
+def _hms(s: int) -> str:
     h, m, s = s // 3600, s % 3600 // 60, s % 60
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def render_page(authed: bool = False, embed: bool = False):
+def _length(s: int) -> str:
+    h, m = s // 3600, s % 3600 // 60
+    return f"{h} h {m} m" if h else f"{m} m"
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def render_page(authed: bool = False, embed: bool = False, host: str = ""):
     """authed=True means the request already has a valid admin cookie."""
+    info = owncast_info()
+    site = info.get("name") or TITLE
+    live = html.escape(LIVE_URL, quote=True)
+    logo = html.escape(LIVE_URL.rstrip("/") + "/logo", quote=True)
+    titles = load_titles()
     vods = merged_vods()
-    if not vods:
-        rows = ('<div class="empty"><b>No past streams yet</b>'
-                'Recordings show up here after each stream.</div>')
-    else:
-        rows, day = [], None
-        gate = ADMIN_PASSWORD != ""
-        for v in vods:
-            if v["date"] != day:
-                if day is not None:
-                    rows.append("</div>")
-                day = v["date"]
-                rows.append(f'<div class="day">{_day_label(day)}</div><div class="grid">')
-            f = html.escape(v["name"])
-            is_cloud = v.get("cloud", False)
-            has_thumb = v.get("thumb", False)
+    gated = ADMIN_PASSWORD != "" and not authed
+    week_ago = time.strftime("%Y-%m-%d", time.localtime(time.time() - 6 * 86400))
 
-            # Thumbnail or placeholder
-            if has_thumb:
-                thumb_src = f"/vods/thumb/{f[:-4]}.jpg"
-                thumb_html = f'<img class="thumb" src="{thumb_src}" alt="" loading="lazy">'
-                data_th = f' data-th="{thumb_src}"'
-            else:
-                thumb_html = '<div class="thumb-ph">▶</div>'
-                data_th = ""
+    data, rows, day = [], [], None
+    for i, v in enumerate(vods):
+        name = v["name"]
+        cloud, recording = v.get("cloud", False), v.get("recording", False)
+        t = time.strptime(v["date"], "%Y-%m-%d")
+        clock = _clock(v["start"])
+        short = f'{time.strftime("%a, %b", t)} {t.tm_mday}'
+        # A stream title that's just the channel name says nothing; use the time.
+        title = titles.get(name, "")
+        if _norm(title) in ("", _norm(site)):
+            title = ""
+        heading = title or f"Stream · {clock}"
+        secs = _duration(v)
+        if recording:
+            span = f"{clock} – now · recording"
+        elif secs:
+            end = time.strftime("%H:%M", time.localtime(v["mtime"]))
+            span = f"{clock} – {_clock(end)} · {_length(secs)}"
+        else:
+            span = clock
+        thumb = f"/vods/thumb/{name[:-4]}.jpg" if v.get("thumb") else ""
+        play = "" if authed else _play_query(name)
+        data.append({
+            "n": name, "th": thumb, "title": heading, "dur": secs, "rec": recording, "cloud": cloud,
+            "src": (f"/vods/cloud/{name}" if cloud else f"/vods/{name}") + play,
+            "dl": f"/vods/cloud/{name}?dl=1" if cloud else f"/vods/download/{name}",
+            "when": f"{short} · {clock}",
+            "meta": f'{time.strftime("%A, %B", t)} {t.tm_mday} · {span}',
+        })
 
-            # Overlays: badge top-left, duration bottom-right
-            if v.get("recording"):
-                badge = '<span class="badge live">● Recording</span>'
-            elif is_cloud:
-                badge = '<span class="badge cloud">☁ Cloud</span>'
-            else:
-                badge = ""
-            dur = _duration(v)
-            dur_html = f'<span class="dur">{dur}</span>' if dur else ""
-
-            # Player src (signed + expiring when a password is set)
-            play = ("" if authed else _play_query(v["name"])).replace("&", "&amp;")
-            player_src = (f"/vods/cloud/{f}" if is_cloud else f"/vods/{f}") + play
-
-            # Download link/button
-            if gate and not authed:
-                dl = (f'<button class="dl" title="Download (admin)" '
-                      f'onclick="openLogin(\'{f}\',{str(is_cloud).lower()})">🔒</button>')
-            else:
-                dl_href = f"/vods/cloud/{f}?dl=1" if is_cloud else f"/vods/download/{f}"
-                dl = f'<a class="dl" href="{dl_href}" title="Download" download>⤓</a>'
-
-            clock = _clock(v["start"])
-            short_date = time.strftime("%b %d", time.strptime(v["date"], "%Y-%m-%d")).replace(" 0", " ")
-            title = f"Stream · {clock}"
-            rows.append(
-                f'<div class="v" data-f="{player_src}" data-n="{f}" '
-                f'data-t="{html.escape(f"{short_date} · {clock}", quote=True)}"{data_th}>'
-                f'<div class="tw">{thumb_html}{badge}{dur_html}'
-                f'<div class="play"><span>▶</span></div></div>'
-                f'<div class="vb"><div class="vinfo">'
-                f'<div class="vtitle">{title}</div>'
-                f'<div class="vmeta">{short_date} · {human(v["size"])}</div>'
-                f'</div>{dl}</div>'
-                f'</div>'
-            )
+        if v["date"] != day:
+            if day is not None:
+                rows.append("</div>")
+            day = v["date"]
+            rows.append(f'<div class="day">{_day_label(day)}</div><div class="grid">')
+        chip = ('<span class="chip rec other">● RECORDING</span>' if recording else
+                '<span class="chip other">☁ CLOUD</span>' if cloud else "")
+        img = (f'<img src="{thumb}" alt="" loading="lazy">' if thumb else '<div class="ph">▶</div>')
+        dur = f'<span class="dur">{_hms(secs)}</span>' if secs else ""
+        count = f'<span class="c">💬 {len(load_comments(name))}</span>' if COMMENTS else ""
+        sub = f"{short} · {clock}" if title else short
+        flags = (' data-wk="1"' if v["date"] >= week_ago else "") + (' data-cloud="1"' if cloud else "")
+        rows.append(
+            f'<a class="card" href="?v={urllib.parse.quote(name)}" data-i="{i}"{flags}>'
+            f'<div class="th">{img}{chip}<span class="chip gold np">▶ NOW PLAYING</span>{dur}<span class="prog"></span></div>'
+            f'<div class="cb"><b>{html.escape(heading)}</b><div class="row"><span>{sub}</span>{count}</div></div></a>'
+        )
+    if vods:
         rows.append("</div>")
-        rows = "\n".join(rows)
-
-    if ADMIN_PASSWORD and not authed:
-        modal = LOGIN_MODAL
-        js = LOGIN_JS
     else:
-        modal = ""
-        js = OPEN_DOWNLOAD_JS
+        rows.append('<div class="empty"><b>No VODs yet</b>Recordings show up here after each stream.</div>')
 
-    return PAGE.format(
-        title=html.escape(TITLE),
-        header="" if embed else (f'<div class="top"><div><h1>{html.escape(TITLE)}</h1>'
-                                 f'<div class="sub">{len(vods)} recording{"" if len(vods) == 1 else "s"}</div></div></div>'),
-        embed_css=EMBED_CSS if embed else "",
-        rows=rows,
-        login_modal=modal,
-        login_js=js,
-        comments_box=COMMENTS_BOX if COMMENTS else "",
-        comments_js=COMMENTS_JS if COMMENTS else "",
+    extra = [f'<a href="{html.escape(u.strip(), quote=True)}" target="_blank" rel="noopener">'
+             f'{html.escape(label.strip())} ↗</a>' for label, u in NAV_LINKS]
+    links = "".join(extra)
+    header = footer = ""
+    if not embed:
+        status = ('<span class="status live"><i></i>Live now</span>' if rec.online
+                  else '<span class="status"><i></i>Offline</span>')
+        header = (f'<header><a href="{live}"><img class="logo" src="{logo}" alt="" onerror="this.remove()"></a>'
+                  f'<div class="brand"><b>{html.escape(site)}</b><span>{html.escape(host)}</span></div>{status}'
+                  f'<nav><a href="{live}">Live</a><a class="on" href="/vods">VODs</a>{links}</nav>'
+                  f'<a class="btn ghost" href="{live}" title="Get notified on the live page">🔔 Notify</a></header>')
+        parts = [html.escape(site), f'<a href="{live}">Watch live</a>'] + extra
+        footer = "<footer>" + " · ".join(parts) + "</footer>"
+
+    stage = ""
+    if vods:
+        tags = "".join(f'<span class="tag">#{html.escape(t)}</span>' for t in info.get("tags", []))
+        stage = _fill(STAGE, SOLO="" if COMMENTS else " solo", SIDE=COMMENTS_SIDE if COMMENTS else "",
+                      LOGO=logo, TAGS=f'<div class="tags">{tags}</div>' if tags else "",
+                      DL_LABEL="🔒 Download" if gated else "⬇ Download")
+
+    n = len(vods)
+    count = f'{n} recording{"" if n == 1 else "s"}'
+    if RETENTION_DAYS > 0:
+        count += f" · kept for {RETENTION_DAYS:g} days"
+    filters = ""
+    if n > 1:
+        filters = ('<button class="on" type="button">All</button>'
+                   '<button type="button" data-f="wk">This week</button>'
+                   + ('<button type="button" data-f="cloud">Cloud</button>'
+                      if any(v.get("cloud") for v in vods) else ""))
+
+    return _fill(
+        PAGE,
+        TITLE=html.escape(f"VODs · {site}"),
+        BODY_CLASS="embed" if embed else "",
+        HEADER=header, STAGE=stage, FOOTER=footer,
+        COUNT=count, FILTERS=filters, ROWS="\n".join(rows),
+        LOGIN_MODAL=LOGIN_MODAL if gated and vods else "",
+        DATA=json.dumps(data).replace("</", "<\\/"),
+        GATED="true" if gated else "false",
+        PAGE_JS=PAGE_JS if vods else "",
+        LOGIN_JS=LOGIN_JS if gated and vods else "",
+        COMMENTS_JS=COMMENTS_JS if COMMENTS and vods else "",
     ).encode()
 
 
@@ -1077,7 +1300,8 @@ class Handler(BaseHTTPRequestHandler):
             authed = _download_allowed(self)
             embed = "embed" in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             # no-store: the page holds expiring playback links
-            return self._send(200, render_page(authed, embed), "text/html; charset=utf-8",
+            host = self.headers.get("Host", "").split(":")[0]
+            return self._send(200, render_page(authed, embed, host), "text/html; charset=utf-8",
                               extra={"Cache-Control": "no-store"})
         if path in ("/", ""):
             return self._send(302, extra={"Location": "/vods"})
@@ -1227,7 +1451,7 @@ class Handler(BaseHTTPRequestHandler):
             c = {"id": secrets.token_hex(6), "uid": user.get("id"),
                  "name": str(user.get("displayName") or "?")[:60],
                  "color": user.get("displayColor") if isinstance(user.get("displayColor"), int) else 0,
-                 "text": text, "t": int(now), "pos": pos}
+                 "mod": _is_mod(user), "text": text, "t": int(now), "pos": pos}
             items.append(c)
             try:
                 save_comments(name, items)

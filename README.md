@@ -375,8 +375,9 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `VOD_PATH` | `./vods` | Folder on the host for VOD files |
 | `RETENTION_DAYS` | `14` | Delete local VODs after N days (`0` = never) |
 | `MIN_FREE_GB` | `5` | Delete the oldest VODs when free space drops below this |
-| `TITLE` | `Stream VODs` | Heading on the VOD page |
-| `LIVE_URL` | `/` | Your stream page (default for `NOTIFY_URL`) |
+| `TITLE` | `Stream VODs` | Page name if Owncast's name can't be read |
+| `LIVE_URL` | `/` | Your stream page (default for `NOTIFY_URL`); the logo comes from `LIVE_URL/logo` |
+| `NAV_LINKS` | – | Extra header links, e.g. `Games\|https://games.example.com` |
 | `PORT` | `8090` | VOD page port |
 | `BIND` | `127.0.0.1` | `0.0.0.0` to listen on all interfaces |
 | `WEBHOOK_TOKEN` | – | Required `?token=` on the webhook URL |
