@@ -45,7 +45,7 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 PORT = int(os.environ.get("PORT", "8090"))
 BIND = os.environ.get("BIND", "0.0.0.0")
 TITLE = os.environ.get("TITLE", "Stream VODs")
-LIVE_URL = os.environ.get("LIVE_URL", "/")  # "back to live" link
+LIVE_URL = os.environ.get("LIVE_URL", "/")  # stream page; default for NOTIFY_URL
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")  # optional ?token=...
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # download gate; empty = open
@@ -760,8 +760,6 @@ a{{color:var(--gold);text-decoration:none}} a:hover{{text-decoration:underline}}
 .top{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px;flex-wrap:wrap}}
 .top h1{{margin:0;font-size:1.6rem;font-weight:800;letter-spacing:-.02em}}
 .top .sub{{color:var(--muted);font-size:.9rem;margin-top:2px}}
-.pill{{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border:1px solid var(--line);border-radius:999px;color:var(--text);font-size:.9rem;font-weight:600;background:var(--card)}}
-.pill:hover{{border-color:var(--gold);text-decoration:none}}
 /* player */
 #stage{{display:none;background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:28px;box-shadow:0 10px 30px rgba(0,0,0,.35)}}
 #stage.on{{display:block}}
@@ -1045,8 +1043,7 @@ def render_page(authed: bool = False, embed: bool = False):
     return PAGE.format(
         title=html.escape(TITLE),
         header="" if embed else (f'<div class="top"><div><h1>{html.escape(TITLE)}</h1>'
-                                 f'<div class="sub">{len(vods)} recording{"" if len(vods) == 1 else "s"}</div></div>'
-                                 f'<a class="pill" href="{html.escape(LIVE_URL, quote=True)}">← Back to live</a></div>'),
+                                 f'<div class="sub">{len(vods)} recording{"" if len(vods) == 1 else "s"}</div></div></div>'),
         embed_css=EMBED_CSS if embed else "",
         rows=rows,
         login_modal=modal,

@@ -224,8 +224,7 @@ A proxy inside a container can't reach the host's `127.0.0.1`. In `.env`, set
 ### Separate subdomain instead
 
 Point e.g. `vods.example.com` at `127.0.0.1:8090` as a normal proxy host. The
-page is at `vods.example.com/vods`, and `/` redirects there. Set
-`LIVE_URL=https://stream.example.com` so "back to live" works.
+page is at `vods.example.com/vods`, and `/` redirects there.
 
 When it's set up, open **`https://stream.example.com/vods`**.
 
@@ -377,7 +376,7 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `RETENTION_DAYS` | `14` | Delete local VODs after N days (`0` = never) |
 | `MIN_FREE_GB` | `5` | Delete the oldest VODs when free space drops below this |
 | `TITLE` | `Stream VODs` | Heading on the VOD page |
-| `LIVE_URL` | `/` | Where "back to live" links |
+| `LIVE_URL` | `/` | Your stream page (default for `NOTIFY_URL`) |
 | `PORT` | `8090` | VOD page port |
 | `BIND` | `127.0.0.1` | `0.0.0.0` to listen on all interfaces |
 | `WEBHOOK_TOKEN` | – | Required `?token=` on the webhook URL |
