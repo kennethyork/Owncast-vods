@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -423,7 +424,11 @@ class Recorder:
                 str(VOD_DIR / "vod_%Y-%m-%d_%H%M%S.mp4"),
             ]
             log("recording", src, "in", SEGMENT_SECONDS, "s chunks")
-            self.proc = subprocess.Popen(cmd)
+            try:
+                self.proc = subprocess.Popen(cmd)
+            except OSError as e:
+                log("could not start ffmpeg:", e)
+                self.proc = None
 
     def stop(self):
         with self.lock:
@@ -445,36 +450,47 @@ class Recorder:
             save_seen(seen)
         thumb_tried: set = set()
         while True:
-            online = self.online = self.stream_online()
-            if online and not self.running:
-                self.start()
-            elif not online and self.running:
-                self.stop()
-            cleanup()
-            # Detect newly finished VODs (not currently recording).
-            vods = list_vods()
-            changed = False
-            for v in vods:
-                name = v["name"]
-                if v.get("recording"):
-                    # Remember the stream title the VOD started with.
-                    if self.stream_title and name not in load_titles():
-                        save_title(name, self.stream_title)
-                    continue
-                if not v["thumb"] and name not in thumb_tried:
-                    thumb_tried.add(name)
-                    make_thumb_bg(name)
-                if name not in seen:
-                    seen.add(name)
-                    changed = True
-                    notify_bg(v)
-            # Forget deleted VODs so the file doesn't grow forever.
-            on_disk = {v["name"] for v in vods}
-            if changed or not seen <= on_disk:
-                seen &= on_disk
-                save_seen(seen)
+            # One bad poll must not kill the thread: the web page would keep
+            # working while nothing ever records again.
+            try:
+                self.step(seen, thumb_tried)
+            except Exception:
+                log("recorder loop error:\n" + traceback.format_exc())
             self.wake.wait(POLL_SECONDS)
             self.wake.clear()
+
+    def step(self, seen, thumb_tried):
+        online = self.online = self.stream_online()
+        if self.proc is not None and self.proc.poll() is not None:
+            log("ffmpeg exited with code", self.proc.returncode)
+            self.proc = None
+        if online and not self.running:
+            self.start()
+        elif not online and self.running:
+            self.stop()
+        cleanup()
+        # Detect newly finished VODs (not currently recording).
+        vods = list_vods()
+        changed = False
+        for v in vods:
+            name = v["name"]
+            if v.get("recording"):
+                # Remember the stream title the VOD started with.
+                if self.stream_title and name not in load_titles():
+                    save_title(name, self.stream_title)
+                continue
+            if not v["thumb"] and name not in thumb_tried:
+                thumb_tried.add(name)
+                make_thumb_bg(name)
+            if name not in seen:
+                seen.add(name)
+                changed = True
+                notify_bg(v)
+        # Forget deleted VODs so the file doesn't grow forever.
+        on_disk = {v["name"] for v in vods}
+        if changed or not seen <= on_disk:
+            seen &= on_disk
+            save_seen(seen)
 
 
 rec = Recorder()
