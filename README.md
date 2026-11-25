@@ -268,7 +268,8 @@ and look for `webhook STREAM_STOPPED` / `webhook STREAM_STARTED`.
 
 A second container uses [rclone](https://rclone.org) to copy every
 **finished** VOD to cloud storage. It runs every 15 minutes and skips the file
-still being recorded. It only **copies**: VODs deleted locally by
+still being recorded, along with each VOD's thumbnail, chat replay, comments,
+likes and stream title. It only **copies**: VODs deleted locally by
 `RETENTION_DAYS` stay in the cloud. Use `BACKUP_RETENTION_DAYS` to clean the
 cloud side too.
 
@@ -448,6 +449,20 @@ likes per VOD are accepted from the same IP address. Likes are stored as
 `vod_*.likes.json` next to each VOD (hashed, no IPs in plain text) and deleted
 with the VOD unless cloud playback is on. `LIKES=0` in `.env` turns them off.
 
+### Search
+
+The search box above the VOD grid filters as you type:
+
+- **Titles and dates** match in the browser: `aehelgard`, `november 20`,
+  `friday`, `yesterday`, `6:05 pm`.
+- **Chat replay and comments** are searched on the server and listed above the
+  grid as moments ("1:13:42 · Fri, Nov 20 · chat · Ada: Brickport harbour…").
+  Click one to play that VOD from that moment. All words must appear; case
+  doesn't matter; up to 60 results, newest VOD first. Hidden chat messages
+  never show up.
+- The search is kept in the address bar (`/vods?q=harbour`), so a search can
+  be shared as a link.
+
 ### Chat replay
 
 The live chat is saved with each VOD and plays back beside the video, in sync,
@@ -546,13 +561,28 @@ running after reboots and crashes, add to `crontab -e`:
 For cloud backup, install rclone into `~/bin` (no root needed):
 
 ```bash
-cd /tmp && curl -LO https://downloads.rclone.org/rclone-current-linux-amd64.zip
-unzip -o rclone-current-linux-amd64.zip && cp rclone-*-linux-amd64/rclone ~/bin/
+mkdir -p ~/bin /tmp/rclone-dl && cd /tmp/rclone-dl
+curl -LO https://downloads.rclone.org/rclone-current-linux-amd64.zip
+python3 -m zipfile -e rclone-current-linux-amd64.zip . && cp rclone-*-linux-amd64/rclone ~/bin/
+chmod +x ~/bin/rclone && cd ~ && rm -rf /tmp/rclone-dl && ~/bin/rclone version | head -1
 ```
 
-Then follow section 7 with `~/bin/rclone config` in place of the
-`docker run ... rclone/rclone config` command. `run.sh` points rclone at the
-same `rclone/rclone.conf` the Docker setup uses.
+Then follow section 7, running rclone from the repo folder as
+`~/bin/rclone --config rclone/rclone.conf ...` in place of
+`docker run ... rclone/rclone ...`. The `--config` part matters: `run.sh`
+reads the remote from `rclone/rclone.conf`, not rclone's usual
+`~/.config/rclone/`. For Dropbox, instead of answering the `config` prompts you
+can create the remote in one line with the token from section 7a:
+
+```bash
+cd ~/owncast-vods && mkdir -p rclone
+~/bin/rclone --config rclone/rclone.conf config create dropbox dropbox token '<paste the {"access_token":...} line>'
+~/bin/rclone --config rclone/rclone.conf lsd dropbox:
+```
+
+Then set the 7b and 7c lines in `.env` and run `./run.sh restart`.
+`./run.sh status` should show `cloud backup: running`, and `backup.log` shows
+each upload.
 
 ---
 

@@ -505,6 +505,52 @@ def record_chat(data: dict):
             log("could not save chat for", name, e)
 
 
+# ---------------------------------------------------------------- search ----
+# Finds VOD moments by chat replay and comment text. Titles and dates are
+# searched in the browser; this covers what the page doesn't load up front.
+SEARCH_MAX = 60
+_search_cache: dict = {}  # path -> ((mtime, size), [(pos, who, text, lowered)])
+
+
+def _search_rows(kind: str, vod_name: str) -> list:
+    path = chat_path(vod_name) if kind == "chat" else comments_path(vod_name)
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    key = (st.st_mtime, st.st_size)
+    hit = _search_cache.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    items = load_chat(vod_name) if kind == "chat" else load_comments(vod_name)
+    rows = []
+    for c in items:
+        pos = c.get("t") if kind == "chat" else c.get("pos")
+        text = str(c.get("text") or "")
+        rows.append((pos if isinstance(pos, (int, float)) else None, str(c.get("name") or "?"),
+                     text, text.lower()))
+    if len(_search_cache) > 1000:
+        _search_cache.clear()
+    _search_cache[path] = (key, rows)
+    return rows
+
+
+def search_vods(q: str) -> list:
+    """Chat and comment lines containing every word of q, newest VOD first."""
+    words = q.lower().split()[:8]
+    if not words:
+        return []
+    out = []
+    for v in merged_vods():
+        for kind in (("chat",) if CHAT_REPLAY else ()) + (("comment",) if COMMENTS else ()):
+            for pos, who, text, low in _search_rows(kind, v["name"]):
+                if all(w in low for w in words):
+                    out.append({"n": v["name"], "kind": kind, "pos": pos, "who": who, "text": text[:200]})
+                    if len(out) >= SEARCH_MAX:
+                        return out
+    return out
+
+
 def set_chat_visibility(ids, visible: bool):
     """Owncast VISIBILITY-UPDATE webhook: a moderator hid or restored messages.
     Only the two newest VODs are checked; older messages are rarely moderated."""
@@ -990,6 +1036,18 @@ main{padding:6px 22px 40px;max-width:1500px;margin:0 auto}
 .filters button{padding:5px 12px;border-radius:99px;font-size:13px;font-weight:600;color:var(--mute);border:1px solid var(--line);background:none;cursor:pointer}
 .filters button:hover{color:var(--text)}
 .filters button.on{color:#1a1206;background:var(--grad);border-color:transparent}
+.search{width:260px;padding:6px 14px;border-radius:99px;border:1px solid var(--line);background:var(--panel);color:var(--text);font-size:13px;margin-right:6px}
+.search:focus{outline:none;border-color:var(--gold)}
+.search::placeholder{color:var(--dim)}
+.hits{margin:16px 0 4px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px;max-height:340px;overflow:auto}
+.hits h3{margin:6px 8px 6px;font-size:13px;font-weight:600;color:var(--mute)}
+.hit{display:flex;gap:10px;align-items:baseline;padding:7px 8px;border-radius:8px;cursor:pointer;font-size:14px}
+.hit:hover{background:var(--panel2)}
+.hit .t{font:600 12px ui-monospace,Consolas,monospace;color:var(--gold);white-space:nowrap;min-width:52px}
+.hit .w{color:var(--mute);font-size:12px;white-space:nowrap}
+.hit .x{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hit .x b{color:#c6cde0;font-weight:600}
+mark{background:#ffc85740;color:inherit;border-radius:3px;padding:0 1px}
 .day{margin:22px 0 12px;font-size:15px;font-weight:700;color:var(--mute)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:18px}
 .card{display:block;border-radius:12px;overflow:hidden;background:var(--panel);border:1px solid var(--line);cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s}
@@ -1032,13 +1090,16 @@ nav a{white-space:nowrap}
 @media (max-width:640px){header{padding:8px 12px;gap:10px}.brand span,.status,header .btn,nav a[target]{display:none}nav a{padding:6px 10px}
   .info{padding:14px 12px;flex-wrap:wrap}.info .logo{display:none}.acts{margin-left:0}
   main{padding:4px 12px 30px}.grid{grid-template-columns:1fr 1fr;gap:12px}.cb{padding:9px 10px 10px}.cb b{font-size:13px}
-  .filters{margin-left:0}.bigplay{width:60px;height:60px;font-size:24px}}
+  .filters{margin-left:0;flex-wrap:wrap}.search{width:100%;margin:0 0 4px}.hit .w{display:none}
+  .bigplay{width:60px;height:60px;font-size:24px}}
 </style></head><body class="%%BODY_CLASS%%">
 %%HEADER%%
 %%STAGE%%
 <main>
-<div class="sec"><h2>VODs</h2><span>%%COUNT%%</span><div class="filters">%%FILTERS%%</div></div>
+<div class="sec"><h2>VODs</h2><span>%%COUNT%%</span><div class="filters">%%SEARCH%%%%FILTERS%%</div></div>
+<div class="hits" id="hits" hidden></div>
 %%ROWS%%
+<div class="empty" id="nomatch" hidden><b>Nothing found</b>Try another word, a date like "November 20", or a game name.</div>
 </main>
 %%FOOTER%%
 %%LOGIN_MODAL%%
@@ -1116,11 +1177,40 @@ $('dl').onclick=function(){if(!cur)return;if(GATED)return openLogin(cur.n,cur.cl
   var a=document.createElement('a');a.href=cur.dl;a.download=cur.n;document.body.appendChild(a);a.click();a.remove();};
 cards().forEach(function(c){cardProg(c);c.onclick=function(e){if(e.ctrlKey||e.metaKey||e.shiftKey||e.button)return;
   e.preventDefault();select(+c.dataset.i,true);scrollTo({top:0,behavior:'smooth'})}});
-document.querySelectorAll('.filters button').forEach(function(b){b.onclick=function(){var f=b.dataset.f;
-  document.querySelectorAll('.filters button').forEach(function(x){x.classList.toggle('on',x===b)});
-  cards().forEach(function(c){c.style.display=!f||c.dataset[f]?'':'none'});
+// Filters + search. Titles and dates match in the browser (VODS[i].q); chat and
+// comment text comes from /vods/api/search and shows as jump-to-moment results.
+var FQ='',HITS=[],sseq=0,stimer=null,QI=$('q');
+function words(){return QI?QI.value.toLowerCase().split(/\\s+/).filter(Boolean):[]}
+function apply(){var w=words(),hit={};HITS.forEach(function(h){hit[h.n]=1});var shown=0;
+  cards().forEach(function(c){var v=VODS[c.dataset.i],
+    ok=(!FQ||c.dataset[FQ])&&(!w.length||hit[v.n]||w.every(function(x){return v.q.indexOf(x)>=0}));
+    c.style.display=ok?'':'none';if(ok)shown++});
   document.querySelectorAll('.grid').forEach(function(g){var any=[].some.call(g.children,function(c){return c.style.display!=='none'});
-    g.style.display=g.previousElementSibling.style.display=any?'':'none'})}});
+    g.style.display=g.previousElementSibling.style.display=any?'':'none'});
+  $('nomatch').hidden=!!shown||!!HITS.length||!(w.length||FQ);}
+function mk(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e}
+function marked(box,text,w){var esc=w.map(function(x){return x.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')});
+  text.split(new RegExp('('+esc.join('|')+')','i')).forEach(function(p,k){box.appendChild(k%2?mk('mark',null,p):document.createTextNode(p))})}
+function showHits(){var box=$('hits'),w=words();box.textContent='';box.hidden=!HITS.length;if(!HITS.length)return;
+  box.appendChild(mk('h3',null,(HITS.length>=60?'60+':HITS.length)+' moment'+(HITS.length===1?'':'s')+' in chat and comments'));
+  HITS.forEach(function(h){var i=VODS.findIndex(function(v){return v.n===h.n});if(i<0)return;
+    var r=mk('div','hit'),x=mk('span','x');r.title='Play from here';
+    r.appendChild(mk('span','t',h.pos!=null?fmt(h.pos):'\\u25b6'));
+    r.appendChild(mk('span','w',VODS[i].when+' \\u00b7 '+(h.kind==='chat'?'chat':'comment')));
+    x.appendChild(mk('b',null,h.who+': '));marked(x,h.text,w);r.appendChild(x);
+    r.onclick=function(){if(VODS[i]===cur&&h.pos!=null)seek(h.pos);else select(i,true,h.pos!=null?h.pos:null);
+      scrollTo({top:0,behavior:'smooth'})};
+    box.appendChild(r)});}
+function search(){var w=words(),q=QI.value.trim(),my=++sseq;
+  var u=new URLSearchParams(location.search);if(q)u.set('q',q);else u.delete('q');history.replaceState(null,'','?'+u);
+  if(!QI.dataset.api||q.length<2){HITS=[];showHits();apply();return}
+  apply();
+  fetch('/vods/api/search?q='+encodeURIComponent(q)).then(function(r){return r.json()}).then(function(d){
+    if(my!==sseq)return;HITS=d.results||[];showHits();apply()}).catch(function(){})}
+if(QI){QI.addEventListener('input',function(){clearTimeout(stimer);stimer=setTimeout(search,250)});
+  var q0=new URLSearchParams(location.search).get('q');if(q0){QI.value=q0;search()}}
+document.querySelectorAll('.filters button').forEach(function(b){b.onclick=function(){FQ=b.dataset.f||'';
+  document.querySelectorAll('.filters button').forEach(function(x){x.classList.toggle('on',x===b)});apply()}});
 // After the rest of the script (comments code) has set itself up.
 document.addEventListener('DOMContentLoaded',function(){var q=new URLSearchParams(location.search),t=parseFloat(q.get('t')),
   i=VODS.findIndex(function(v){return v.n===q.get('v')});
@@ -1363,6 +1453,9 @@ def render_page(authed: bool = False, embed: bool = False, host: str = "", viewe
             "when": f"{short} · {clock}",
             "meta": f'{time.strftime("%A, %B", t)} {t.tm_mday} · {span}',
             "lk": likes, "liked": LIKES and viewer_liked(name, viewer),
+            # what the search box matches in the browser: title, dates, times
+            "q": " ".join((heading, title, _day_label(v["date"]), v["date"], short,
+                           time.strftime("%A %B %Y", t), span)).lower(),
         })
 
         if v["date"] != day:
@@ -1414,6 +1507,7 @@ def render_page(authed: bool = False, embed: bool = False, host: str = "", viewe
                       LOGO=logo, LIKE_BTN=LIKE_BTN if LIKES else "", TAGS=f'<div class="tags">{tags}</div>' if tags else "",
                       DL_LABEL="🔒 Download" if gated else "⬇ Download")
 
+    search_api = COMMENTS or CHAT_REPLAY
     n = len(vods)
     count = f'{n} recording{"" if n == 1 else "s"}'
     if RETENTION_DAYS > 0:
@@ -1431,6 +1525,9 @@ def render_page(authed: bool = False, embed: bool = False, host: str = "", viewe
         BODY_CLASS="embed" if embed else "",
         HEADER=header, STAGE=stage, FOOTER=footer,
         COUNT=count, FILTERS=filters, ROWS="\n".join(rows),
+        SEARCH=(f'<input class="search" id="q" type="search" autocomplete="off" aria-label="Search VODs" '
+                f'placeholder="{"Search titles, dates, chat, comments" if search_api else "Search titles and dates"}"'
+                f'{" data-api=1" if search_api else ""}>') if vods else "",
         LOGIN_MODAL=LOGIN_MODAL if gated and vods else "",
         DATA=json.dumps(data).replace("</", "<\\/"),
         GATED="true" if gated else "false",
@@ -1496,6 +1593,11 @@ class Handler(BaseHTTPRequestHandler):
             if not vod_exists(name):
                 return self._json(404, {"error": "not_found"})
             return self._json(200, {"chat": load_chat(name)}, extra={"Cache-Control": "no-store"})
+        if path == "/vods/api/search":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("q", [""])[0].strip()
+            if not 2 <= len(q) <= 100:
+                return self._json(400, {"error": "bad_query"})
+            return self._json(200, {"results": search_vods(q)}, extra={"Cache-Control": "no-store"})
         # /vods/download/<name>  — gated download (triggers Content-Disposition)
         if path.startswith("/vods/download/"):
             if not _download_allowed(self):

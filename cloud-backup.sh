@@ -34,14 +34,17 @@ start_webdav &
 while true; do
   if rclone listremotes 2>/dev/null | grep -qx "$REMOTE_NAME:"; then
     # --min-age 3m skips the file that is still being recorded.
-    # Thumbnails (.jpg) go too, so cloud-only VODs keep their preview image.
+    # Thumbnails (.jpg) go too, so cloud-only VODs keep their preview image,
+    # plus chat replay, comments, likes and stream titles so the copy is complete.
     rclone copy "$SRC" "$DEST" \
-      --include 'vod_*.mp4' --include 'vod_*.jpg' --min-age 3m \
+      --include 'vod_*.mp4' --include 'vod_*.jpg' --include 'vod_*.chat.jsonl' \
+      --include 'vod_*.comments.json' --include 'vod_*.likes.json' --include '.titles.json' \
+      --min-age 3m \
       --transfers 2 --dropbox-chunk-size 64M \
       --retries 5 --low-level-retries 20 \
       --stats 10m --stats-one-line -v
     if [ "$KEEP_DAYS" -gt 0 ] 2>/dev/null; then
-      rclone delete "$DEST" --include 'vod_*.mp4' --include 'vod_*.jpg' \
+      rclone delete "$DEST" --include 'vod_*' \
         --min-age "${KEEP_DAYS}d" -v
     fi
   else
