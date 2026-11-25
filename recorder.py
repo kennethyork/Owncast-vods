@@ -431,145 +431,187 @@ def merged_vods() -> list:
 
 
 # ------------------------------------------------------------------ http ----
-PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title><style>
-body{{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px;max-width:900px;margin:auto}}
-h1{{font-size:1.3rem}}
-video{{width:100%;background:#000;border-radius:8px;display:none;margin-bottom:12px}}
-.day{{margin-top:18px;color:#aaa;font-size:.9rem;border-bottom:1px solid #333;padding-bottom:4px}}
-.v{{display:flex;align-items:center;gap:12px;padding:8px;border-radius:6px;cursor:pointer}}
-.v:hover{{background:#222}}
-.thumb{{width:120px;height:68px;object-fit:cover;border-radius:4px;background:#222;flex-shrink:0}}
-.thumb-ph{{width:120px;height:68px;border-radius:4px;background:#1a1a1a;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:1.6rem;color:#444}}
-.vinfo{{flex:1;min-width:0}}
-.vtitle{{font-size:.95rem}}
-.vmeta{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px}}
-.live{{color:#f55;font-weight:600}}
-.cloud{{color:#8ab4f8;font-size:.8rem}}
-.vactions{{margin-left:auto;white-space:nowrap}}
-a{{color:#8ab4f8}} small{{color:#888}}
-/* login modal */
-#modal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);align-items:center;justify-content:center;z-index:99}}
-#modal.open{{display:flex}}
-#mbox{{background:#1e1e1e;padding:24px;border-radius:10px;min-width:260px;text-align:center}}
-#mbox h2{{margin:0 0 16px;font-size:1rem}}
-#mbox input{{width:100%;padding:8px;border:1px solid #444;border-radius:6px;background:#111;color:#eee;font-size:1rem;box-sizing:border-box}}
-#mbox button{{margin-top:12px;width:100%;padding:9px;background:#8ab4f8;color:#000;border:0;border-radius:6px;font-size:1rem;cursor:pointer;font-weight:600}}
-#merr{{color:#f55;font-size:.85rem;margin-top:8px;min-height:1em}}
-</style></head><body>
-<h1>{title}</h1><p><a href="{live}">← back to live</a></p>
-<video id="p" controls playsinline></video>
-{rows}
-{login_modal}
-<script>
-document.querySelectorAll('.v').forEach(r=>r.onclick=e=>{{
-  if(e.target.tagName==='A'||e.target.closest('button'))return;
+_SHARED_CSS = """
+body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px;max-width:960px;margin:auto}
+h1{font-size:1.3rem}
+video{width:100%;background:#000;border-radius:8px;display:none;margin-bottom:12px}
+.day{margin-top:18px;color:#aaa;font-size:.9rem;border-bottom:1px solid #333;padding-bottom:4px}
+.v{display:flex;align-items:center;gap:12px;padding:8px;border-radius:6px;cursor:pointer}
+.v:hover{background:#222}
+.thumb{width:120px;height:68px;object-fit:cover;border-radius:4px;background:#222;flex-shrink:0}
+.thumb-ph{width:120px;height:68px;border-radius:4px;background:#1a1a1a;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:1.6rem;color:#444}
+.vinfo{flex:1;min-width:0}
+.vtitle{font-size:.95rem}
+.vmeta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px}
+.live{color:#f55;font-weight:600}
+.cloud{color:#8ab4f8;font-size:.8rem}
+.vactions{margin-left:auto;white-space:nowrap;display:flex;gap:8px;align-items:center}
+a{color:#8ab4f8} small{color:#888}
+.btn{padding:5px 11px;border-radius:5px;border:0;cursor:pointer;font-size:.85rem;font-weight:600}
+.btn-dl{background:#8ab4f8;color:#000}
+.btn-del{background:#c0392b;color:#fff}
+.btn-del:hover{background:#e74c3c}
+"""
+
+_PLAYER_JS = """
+document.querySelectorAll('.v').forEach(r=>r.onclick=e=>{
+  if(e.target.tagName==='A'||e.target.closest('button')||e.target.closest('a'))return;
   var p=document.getElementById('p'),src=r.dataset.f,th=r.dataset.th||'';
   p.style.display='block';
   if(th)p.poster=th; else p.removeAttribute('poster');
   p.src=src;p.play();scrollTo(0,0);
-}});
-{login_js}
+});
+"""
+
+# ── Public VOD page (/vods) ──────────────────────────────────────────────────
+
+def _vod_rows_public(vods):
+    rows, day = [], None
+    for v in vods:
+        if v["date"] != day:
+            day = v["date"]
+            rows.append(f'<div class="day">{day}</div>')
+        f = html.escape(v["name"])
+        is_cloud = v.get("cloud", False)
+        has_thumb = v.get("thumb", False)
+        thumb_src = f"/vods/thumb/{f[:-4]}.jpg" if has_thumb else ""
+        thumb_html = (f'<img class="thumb" src="{thumb_src}" alt="" loading="lazy">'
+                      if has_thumb else '<div class="thumb-ph">▶</div>')
+        data_th = f' data-th="{thumb_src}"' if has_thumb else ""
+        live_badge = '<span class="live">● recording</span>' if v.get("recording") else ""
+        cloud_badge = '<span class="cloud">☁ cloud</span>' if is_cloud else ""
+        player_src = f"/vods/cloud/{f}" if is_cloud else f"/vods/{f}"
+        rows.append(
+            f'<div class="v" data-f="{player_src}"{data_th}>'
+            f'{thumb_html}'
+            f'<div class="vinfo">'
+            f'<div class="vtitle">▶ {v["date"]} {v["start"]}'
+            f'{" " if live_badge or cloud_badge else ""}{live_badge}{cloud_badge}</div>'
+            f'<div class="vmeta"><small>{human(v["size"])}</small></div>'
+            f'</div></div>'
+        )
+    return "\n".join(rows) if rows else "<p>No VODs yet.</p>"
+
+
+def render_page():
+    vods = merged_vods()
+    rows = _vod_rows_public(vods)
+    admin_link = (f'<a href="/admin" style="font-size:.85rem;float:right">Admin</a>'
+                  if ADMIN_PASSWORD else "")
+    return (f'<!doctype html><html><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{html.escape(TITLE)}</title>'
+            f'<style>{_SHARED_CSS}</style></head><body>'
+            f'<h1>{html.escape(TITLE)}{admin_link}</h1>'
+            f'<p><a href="{html.escape(LIVE_URL, quote=True)}">← back to live</a></p>'
+            f'<video id="p" controls playsinline></video>'
+            f'{rows}'
+            f'<script>{_PLAYER_JS}</script>'
+            f'</body></html>').encode()
+
+# ── Admin login page (/admin) ────────────────────────────────────────────────
+
+_ADMIN_LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin login</title><style>
+body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;
+     display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{background:#1e1e1e;padding:32px;border-radius:12px;min-width:280px;text-align:center}
+h2{margin:0 0 20px;font-size:1.1rem}
+input{width:100%;padding:9px;border:1px solid #444;border-radius:6px;background:#111;
+      color:#eee;font-size:1rem;box-sizing:border-box}
+button{margin-top:14px;width:100%;padding:10px;background:#8ab4f8;color:#000;
+       border:0;border-radius:6px;font-size:1rem;cursor:pointer;font-weight:600}
+.err{color:#f55;font-size:.85rem;margin-top:10px;min-height:1em}
+</style></head><body>
+<div class="box">
+<h2>Admin login</h2>
+<input id="pw" type="password" placeholder="Password" autocomplete="current-password">
+<button onclick="doLogin()">Log in</button>
+<div class="err" id="err"></div>
+</div>
+<script>
+document.getElementById('pw').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
+setTimeout(()=>document.getElementById('pw').focus(),50);
+function doLogin(){
+  var pw=document.getElementById('pw').value;
+  fetch('/vods/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({password:pw})})
+  .then(r=>r.json()).then(d=>{
+    if(d.ok){location.href='/admin';}
+    else{document.getElementById('err').textContent='Wrong password.';}
+  });
+}
 </script></body></html>"""
 
-LOGIN_MODAL = """<div id="modal"><div id="mbox">
-<h2>Admin login to download</h2>
-<input id="mpw" type="password" placeholder="Password" autocomplete="current-password">
-<button onclick="doLogin()">Login</button>
-<div id="merr"></div>
-</div></div>"""
+# ── Admin dashboard (/admin — requires auth) ─────────────────────────────────
 
-LOGIN_JS = """
-var _dlFile=null,_dlCloud=false;
-function openLogin(f,cloud){_dlFile=f;_dlCloud=cloud||false;
-  document.getElementById('modal').classList.add('open');
-  setTimeout(()=>document.getElementById('mpw').focus(),50);}
-document.getElementById('modal').onclick=function(e){if(e.target===this)this.classList.remove('open');};
-document.getElementById('mpw').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
-function doLogin(){
-  var pw=document.getElementById('mpw').value;
-  fetch('/vods/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})})
-  .then(r=>r.json()).then(d=>{
-    if(d.ok){document.getElementById('modal').classList.remove('open');
-              document.getElementById('mpw').value='';
-              if(_dlFile){var a=document.createElement('a');
-                a.href=_dlCloud?'/vods/cloud/'+_dlFile+'?dl=1':'/vods/download/'+_dlFile;
-                a.download=_dlFile;a.click();}
-    }else{document.getElementById('merr').textContent='Wrong password.';}
-  });
-}"""
-
-OPEN_DOWNLOAD_JS = ""  # no modal needed when downloads are open
-
-
-def render_page(authed: bool = False):
-    """authed=True means the request already has a valid admin cookie."""
+def render_admin():
     vods = merged_vods()
-    if not vods:
-        rows = "<p>No VODs yet.</p>"
-    else:
-        rows, day = [], None
-        gate = ADMIN_PASSWORD != ""
-        for v in vods:
-            if v["date"] != day:
-                day = v["date"]
-                rows.append(f'<div class="day">{day}</div>')
-            f = html.escape(v["name"])
-            is_cloud = v.get("cloud", False)
-            has_thumb = v.get("thumb", False)
-
-            # Thumbnail or placeholder
-            if has_thumb:
-                thumb_src = f"/vods/thumb/{f[:-4]}.jpg"
-                thumb_html = f'<img class="thumb" src="{thumb_src}" alt="" loading="lazy">'
-                data_th = f' data-th="{thumb_src}"'
-            else:
-                thumb_html = '<div class="thumb-ph">▶</div>'
-                data_th = ""
-
-            # Badges
-            live_badge = '<span class="live">● recording</span>' if v.get("recording") else ""
-            cloud_badge = '<span class="cloud">☁ cloud</span>' if is_cloud else ""
-
-            # Player src
-            player_src = f"/vods/cloud/{f}" if is_cloud else f"/vods/{f}"
-
-            # Download link/button
-            if gate and not authed:
-                dl = (f'<button style="background:none;border:none;cursor:pointer;'
-                      f'color:#8ab4f8;font-size:.9rem" '
-                      f'onclick="openLogin(\'{f}\',{str(is_cloud).lower()})">🔒 download</button>')
-            else:
-                dl_href = f"/vods/cloud/{f}?dl=1" if is_cloud else f"/vods/download/{f}"
-                dl = f'<a href="{dl_href}" download>download</a>'
-
-            rows.append(
-                f'<div class="v" data-f="{player_src}"{data_th}>'
-                f'{thumb_html}'
-                f'<div class="vinfo">'
-                f'<div class="vtitle">▶ {v["date"]} {v["start"]}{" " if live_badge or cloud_badge else ""}{live_badge}{cloud_badge}</div>'
-                f'<div class="vmeta"><small>{human(v["size"])}</small></div>'
-                f'</div>'
-                f'<div class="vactions">{dl}</div>'
-                f'</div>'
-            )
-        rows = "\n".join(rows)
-
-    if ADMIN_PASSWORD and not authed:
-        modal = LOGIN_MODAL
-        js = LOGIN_JS
-    else:
-        modal = ""
-        js = OPEN_DOWNLOAD_JS
-
-    return PAGE.format(
-        title=html.escape(TITLE),
-        live=html.escape(LIVE_URL, quote=True),
-        rows=rows,
-        login_modal=modal,
-        login_js=js,
-    ).encode()
+    rows, day = [], None
+    for v in vods:
+        if v["date"] != day:
+            day = v["date"]
+            rows.append(f'<div class="day">{day}</div>')
+        f = html.escape(v["name"])
+        is_cloud = v.get("cloud", False)
+        has_thumb = v.get("thumb", False)
+        recording = v.get("recording", False)
+        thumb_src = f"/vods/thumb/{f[:-4]}.jpg" if has_thumb else ""
+        thumb_html = (f'<img class="thumb" src="{thumb_src}" alt="" loading="lazy">'
+                      if has_thumb else '<div class="thumb-ph">▶</div>')
+        data_th = f' data-th="{thumb_src}"' if has_thumb else ""
+        live_badge = '<span class="live">● recording</span>' if recording else ""
+        cloud_badge = '<span class="cloud">☁ cloud</span>' if is_cloud else ""
+        player_src = f"/vods/cloud/{f}" if is_cloud else f"/vods/{f}"
+        dl_href = f"/vods/cloud/{f}?dl=1" if is_cloud else f"/vods/download/{f}"
+        dl_btn = f'<a class="btn btn-dl" href="{dl_href}" download>⬇ Download</a>'
+        if recording or is_cloud:
+            del_btn = ""  # can't delete while recording or if cloud-only
+        else:
+            del_btn = (f'<button class="btn btn-del" '
+                       f'onclick="delVod(\'{f}\',this)">🗑 Delete</button>')
+        rows.append(
+            f'<div class="v" data-f="{player_src}"{data_th} id="row-{f}">'
+            f'{thumb_html}'
+            f'<div class="vinfo">'
+            f'<div class="vtitle">▶ {v["date"]} {v["start"]}'
+            f'{" " if live_badge or cloud_badge else ""}{live_badge}{cloud_badge}</div>'
+            f'<div class="vmeta"><small>{human(v["size"])}</small></div>'
+            f'</div>'
+            f'<div class="vactions">{dl_btn}{del_btn}</div>'
+            f'</div>'
+        )
+    body = "\n".join(rows) if rows else "<p>No VODs yet.</p>"
+    return (f'<!doctype html><html><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>Admin – {html.escape(TITLE)}</title>'
+            f'<style>{_SHARED_CSS}</style></head><body>'
+            f'<h1>Admin – {html.escape(TITLE)} '
+            f'<a href="/vods" style="font-size:.8rem;font-weight:400">← public page</a>'
+            f'&nbsp;<a href="/admin/logout" style="font-size:.8rem;font-weight:400;color:#888">log out</a>'
+            f'</h1>'
+            f'<video id="p" controls playsinline></video>'
+            f'{body}'
+            f'<script>'
+            f'{_PLAYER_JS}'
+            f"""
+function delVod(name,btn){{
+  if(!confirm('Delete '+name+'?'))return;
+  btn.disabled=true;btn.textContent='Deleting…';
+  fetch('/admin/delete',{{method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{name:name}})}})
+  .then(r=>r.json()).then(d=>{{
+    if(d.ok){{
+      var row=document.getElementById('row-'+name);
+      if(row)row.remove();
+    }}else{{btn.disabled=false;btn.textContent='🗑 Delete';alert(d.error||'Delete failed');}}
+  }}).catch(()=>{{btn.disabled=false;btn.textContent='🗑 Delete';alert('Network error');}});
+}}
+"""
+            f'</script>'
+            f'</body></html>').encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -592,13 +634,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        # ---- public VOD page (read-only, no auth) ----
         if path in ("/vods", "/vods/"):
-            authed = _download_allowed(self)
-            return self._send(200, render_page(authed), "text/html; charset=utf-8")
+            return self._send(200, render_page(), "text/html; charset=utf-8")
         if path in ("/", ""):
             return self._send(302, extra={"Location": "/vods"})
         if path == "/vods/api/list":
             return self._send(200, json.dumps(merged_vods()).encode(), "application/json")
+        # ---- admin pages ----
+        if path in ("/admin", "/admin/"):
+            if not _download_allowed(self):
+                return self._send(200, _ADMIN_LOGIN_PAGE.encode(), "text/html; charset=utf-8")
+            return self._send(200, render_admin(), "text/html; charset=utf-8")
+        if path == "/admin/logout":
+            self.send_response(302)
+            self.send_header("Location", "/admin")
+            self.send_header("Set-Cookie",
+                "vod_admin=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         # /vods/download/<name>  — gated download (triggers Content-Disposition)
         if path.startswith("/vods/download/"):
             if not _download_allowed(self):
@@ -623,6 +678,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        # ---- Admin delete ----
+        if u.path == "/admin/delete":
+            if not _download_allowed(self):
+                return self._send(403, json.dumps({"ok": False, "error": "login required"}).encode(),
+                                  "application/json")
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+                name = body.get("name", "")
+            except (ValueError, AttributeError):
+                name = ""
+            if not FILE_RE.match(name):
+                return self._send(400, json.dumps({"ok": False, "error": "invalid name"}).encode(),
+                                  "application/json")
+            # find the VOD in the local list (can't delete cloud-only)
+            match = next((v for v in list_vods() if v["name"] == name), None)
+            if not match:
+                return self._send(404, json.dumps({"ok": False, "error": "not found"}).encode(),
+                                  "application/json")
+            if match.get("recording"):
+                return self._send(409, json.dumps({"ok": False, "error": "currently recording"}).encode(),
+                                  "application/json")
+            _delete(match, "admin")
+            return self._send(200, json.dumps({"ok": True}).encode(), "application/json")
         # ---- Admin login ----
         if u.path == "/vods/login":
             n = int(self.headers.get("Content-Length") or 0)
