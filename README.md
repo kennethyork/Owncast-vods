@@ -242,11 +242,22 @@ In the Owncast admin (`/admin`) → **Integrations**:
 - **Open in new tab:** off shows the page as a pop-up over the stream; on
   opens the full page.
 
-### Instant start/stop (Webhook, recommended)
+### Instant start/stop and chat replay (Webhook, recommended)
 
 **Webhooks → Create webhook**
 - **URL:** `https://stream.example.com/vods/webhook?token=YOUR_WEBHOOK_TOKEN`
-- **Events:** **Stream Started** and **Stream Stopped**
+- **Events:** **Stream Started**, **Stream Stopped**, **Chat Message** and
+  **Message Visibility Changed** (the last two are for chat replay)
+
+Or let a script do it. On the Owncast server, in this folder:
+
+```bash
+python3 owncast-webhook.py https://stream.example.com
+```
+
+It asks for the Owncast admin password, reads `WEBHOOK_TOKEN` from `.env`, and
+replaces an existing `/vods/webhook` entry (Owncast can't edit a webhook's
+events). Other webhooks are left alone.
 
 Test it: stop and restart your broadcast, then run `docker compose logs vods`
 and look for `webhook STREAM_STOPPED` / `webhook STREAM_STARTED`.
@@ -432,6 +443,20 @@ won't see the chat identity.
   unless cloud playback (`CLOUD_URL`) is on, in which case they stay for the
   cloud copy.
 
+### Chat replay
+
+The live chat is saved with each VOD and plays back beside the video, in sync,
+like a Twitch replay. It needs the **Chat Message** event on the webhook
+(section 6); **Message Visibility Changed** makes messages a moderator hides
+disappear from the replay too.
+
+- Only chat sent while a VOD is recording is saved. VODs recorded before you
+  added the webhook events have no chat.
+- Click a message's timestamp to jump there. Seeking moves the chat with you.
+- Stored as `vod_*.chat.jsonl` next to each VOD (up to 50,000 messages), and
+  deleted with the VOD unless cloud playback (`CLOUD_URL`) is on.
+- `CHAT_REPLAY=0` in `.env` turns it off.
+
 ### Admin downloads
 
 Set `ADMIN_PASSWORD` in `.env` to protect downloads (e.g. for uploading to YouTube)
@@ -512,6 +537,40 @@ Run these in `/opt/owncast-vods`:
 | Apply `.env` changes | `docker compose up -d` |
 | Update to latest | `git pull && docker compose up -d --build` |
 | Disk usage | `du -sh vods && df -h .` |
+
+### Without Docker
+
+The recorder only needs Python 3.9+ and ffmpeg, so it can run from a normal
+user account. `run.sh` loads `.env`, saves VODs to `VOD_PATH`, uses
+`/usr/bin/ffmpeg` when it exists, and starts the cloud backup too when
+`COMPOSE_PROFILES=backup` is set.
+
+| Task | Command |
+|---|---|
+| Start (does nothing if already running) | `./run.sh` |
+| Restart, e.g. after `git pull` or `.env` changes | `./run.sh restart` |
+| Stop | `./run.sh stop` |
+| What's running | `./run.sh status` |
+| Logs | `tail -f recorder.log` / `tail -f backup.log` |
+
+A restart ends the VOD being recorded, so do it while offline. To keep it
+running after reboots and crashes, add to `crontab -e`:
+
+```
+@reboot     $HOME/owncast-vods/run.sh >/dev/null 2>&1
+*/5 * * * * $HOME/owncast-vods/run.sh >/dev/null 2>&1
+```
+
+For cloud backup, install rclone into `~/bin` (no root needed):
+
+```bash
+cd /tmp && curl -LO https://downloads.rclone.org/rclone-current-linux-amd64.zip
+unzip -o rclone-current-linux-amd64.zip && cp rclone-*-linux-amd64/rclone ~/bin/
+```
+
+Then follow section 7 with `~/bin/rclone config` in place of the
+`docker run ... rclone/rclone config` command. `run.sh` points rclone at the
+same `rclone/rclone.conf` the Docker setup uses.
 
 ---
 

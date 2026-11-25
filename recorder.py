@@ -30,6 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -55,6 +56,8 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # download gate; empty = 
 CLOUD_URL = os.environ.get("CLOUD_URL", "").rstrip("/")  # e.g. http://127.0.0.1:8091
 # Comments under VODs, signed with the viewer's Owncast chat name.
 COMMENTS = os.environ.get("COMMENTS", "1") not in ("0", "false", "no", "")
+# Save live chat (Owncast CHAT webhook) next to each VOD and replay it in sync.
+CHAT_REPLAY = os.environ.get("CHAT_REPLAY", "1") not in ("0", "false", "no", "")
 # Extra header links, "Label|URL" pairs separated by commas,
 # e.g. NAV_LINKS="Games|https://games.example.com"
 NAV_LINKS = [tuple(p.split("|", 1)) for p in os.environ.get("NAV_LINKS", "").split(",") if "|" in p]
@@ -368,6 +371,124 @@ def save_comments(vod_name: str, items: list):
     tmp.replace(path)
 
 
+# ----------------------------------------------------------- chat replay ----
+# One JSON object per line: {"id", "t" (seconds into the VOD), "name", "color",
+# "mod", "text"} plus "h": 1 while a moderator has the message hidden.
+CHAT_MAX_PER_VOD = 50000
+_chat_lock = threading.Lock()
+_chat_counts: dict = {}
+_TS_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)?$")
+
+
+def chat_path(vod_name: str) -> Path:
+    return VOD_DIR / (vod_name[:-4] + ".chat.jsonl")  # vod_*.mp4 → vod_*.chat.jsonl
+
+
+def _parse_ts(s: str):
+    """Unix time from Owncast's RFC 3339 timestamp (nanoseconds allowed)."""
+    m = _TS_RE.match(s or "")
+    if not m:
+        return None
+    tz = m.group(3) or "Z"
+    stamp = m.group(1) + (m.group(2) or "")[:7] + ("+00:00" if tz == "Z" else tz)
+    try:
+        return datetime.fromisoformat(stamp).timestamp()
+    except ValueError:
+        return None
+
+
+def _read_chat(vod_name: str) -> list:
+    items = []
+    try:
+        with chat_path(vod_name).open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    c = json.loads(line)
+                except ValueError:
+                    continue  # a line cut short by a crash
+                if isinstance(c, dict):
+                    items.append(c)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log("could not read chat for", vod_name, e)
+    return items
+
+
+def load_chat(vod_name: str) -> list:
+    """Visible messages, oldest first, for the page."""
+    out = [{k: c.get(k) for k in ("t", "name", "color", "mod", "text")}
+           for c in _read_chat(vod_name) if not c.get("h") and isinstance(c.get("t"), (int, float))]
+    out.sort(key=lambda c: c["t"])
+    return out
+
+
+def record_chat(data: dict):
+    """Owncast CHAT webhook → append to the VOD being recorded at that moment."""
+    if not CHAT_REPLAY or not rec.running:
+        return  # chat while offline isn't part of any VOD
+    now = time.time()
+    ts = _parse_ts(str(data.get("timestamp") or ""))
+    if ts is None or abs(ts - now) > 3600:
+        ts = now
+    vod = next((v for v in list_vods() if _vod_start(v) <= ts + 5), None)  # newest first
+    if vod is None:
+        return
+    pos = max(0.0, ts - _vod_start(vod))
+    if pos > SEGMENT_SECONDS + 3600:
+        return
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    text = str(data.get("rawBody") or "") or html.unescape(re.sub(r"<[^>]+>", "", str(data.get("body") or "")))
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text).strip()[:COMMENT_MAX_LEN]
+    if not text:
+        return
+    color = user.get("displayColor")
+    line = {"id": str(data.get("id") or "")[:64], "t": round(pos, 1),
+            "name": str(user.get("displayName") or "?")[:60],
+            "color": color if isinstance(color, int) else 0, "mod": _is_mod(user), "text": text}
+    if data.get("visible") is False:
+        line["h"] = 1
+    name = vod["name"]
+    with _chat_lock:
+        if name not in _chat_counts:
+            _chat_counts[name] = len(_read_chat(name))
+        if _chat_counts[name] >= CHAT_MAX_PER_VOD:
+            return
+        try:
+            with chat_path(name).open("a", encoding="utf-8") as f:
+                f.write(json.dumps(line) + "\n")
+            _chat_counts[name] += 1
+        except OSError as e:
+            log("could not save chat for", name, e)
+
+
+def set_chat_visibility(ids, visible: bool):
+    """Owncast VISIBILITY-UPDATE webhook: a moderator hid or restored messages.
+    Only the two newest VODs are checked; older messages are rarely moderated."""
+    ids = {str(i) for i in ids or [] if i}
+    if not CHAT_REPLAY or not ids:
+        return
+    with _chat_lock:
+        for v in list_vods()[:2]:
+            items = _read_chat(v["name"])
+            changed = False
+            for c in items:
+                if c.get("id") in ids and bool(c.get("h")) == visible:
+                    if visible:
+                        del c["h"]
+                    else:
+                        c["h"] = 1
+                    changed = True
+            if changed:
+                path = chat_path(v["name"])
+                tmp = path.with_suffix(".tmp")
+                try:
+                    tmp.write_text("".join(json.dumps(c) + "\n" for c in items), encoding="utf-8")
+                    tmp.replace(path)
+                except OSError as e:
+                    log("could not update chat for", v["name"], e)
+
+
 def log(*a):
     print(time.strftime("[%Y-%m-%d %H:%M:%S]"), *a, flush=True)
 
@@ -594,9 +715,10 @@ def _delete(v, why):
         log("deleted", v["name"], f"({why})")
     except OSError as e:
         log("delete failed", v["name"], e)
-    # Remove the matching thumbnail too. Comments stay while the VOD can still
-    # be watched from the cloud copy.
-    extras = [thumb_path(v["name"])] + ([] if CLOUD_URL else [comments_path(v["name"])])
+    # Remove the matching thumbnail too. Comments and chat stay while the VOD
+    # can still be watched from the cloud copy.
+    extras = [thumb_path(v["name"])] + ([] if CLOUD_URL else [comments_path(v["name"]), chat_path(v["name"])])
+    _chat_counts.pop(v["name"], None)
     for p in extras:
         if p.exists():
             try:
@@ -880,7 +1002,16 @@ nav a.on{color:var(--text);background:var(--panel2)}
 .side-in{position:absolute;inset:0;display:flex;flex-direction:column}
 .side h3{margin:0;padding:14px 16px;font-size:13px;letter-spacing:.6px;text-transform:uppercase;color:var(--mute);border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
 .side h3 em{font-style:normal;color:var(--gold)}
-#clist{flex:1;overflow:auto;padding:8px 6px}
+.tabs{display:flex;border-bottom:1px solid var(--line)}
+.tabs button{flex:1;padding:13px 10px;background:none;border:0;border-bottom:2px solid transparent;margin-bottom:-1px;font-size:13px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--mute);cursor:pointer}
+.tabs button:hover{color:var(--text)}
+.tabs button.on{color:var(--text);border-bottom-color:var(--gold)}
+.tabs em{font-style:normal;color:var(--gold);margin-left:4px}
+.pane{flex:1;min-height:0;display:flex;flex-direction:column}
+.pane[hidden]{display:none}
+#clist,#chlist{flex:1;overflow:auto;padding:8px 6px}
+#chlist .m{padding:5px 10px}
+.chnote{font-size:12px;color:var(--dim);text-align:center;padding:8px;border-top:1px solid var(--line)}
 .m{position:relative;padding:8px 26px 8px 10px;border-radius:8px}
 .m:hover{background:var(--panel2)}
 .m .t{display:inline-block;margin-right:6px;padding:0 6px;border-radius:4px;background:#ffc85722;color:var(--gold);font:600 12px/18px ui-monospace,Consolas,monospace;cursor:pointer}
@@ -974,6 +1105,8 @@ nav a{white-space:nowrap}
 var VODS=%%DATA%%,GATED=%%GATED%%;
 %%PAGE_JS%%
 %%LOGIN_JS%%
+%%SIDE_JS%%
+%%CHAT_JS%%
 %%COMMENTS_JS%%
 </script></body></html>"""
 
@@ -1018,7 +1151,8 @@ function select(i,play,t,quiet){var v=VODS[i];if(!v)return;
   cards().forEach(function(c){c.classList.toggle('now',+c.dataset.i===i);cardProg(c)});
   if(!quiet){var q=new URLSearchParams(location.search);q.set('v',v.n);q.delete('t');history.replaceState(null,'','?'+q)}
   if(play)P.play().catch(function(){});
-  if(window.loadComments)loadComments(v.n);}
+  if(window.loadComments)loadComments(v.n);
+  if(window.loadChat)loadChat(v.n);}
 P.addEventListener('play',function(){$('stage').classList.add('playing')});
 P.addEventListener('pause',function(){$('stage').classList.remove('playing');if(cur)save(cur.n,P.currentTime)});
 P.addEventListener('ended',function(){if(cur)save(cur.n,0)});
@@ -1026,7 +1160,8 @@ P.addEventListener('timeupdate',function(){if(!cur)return;var d=dur();
   $('mprog').style.width=d?Math.min(100,P.currentTime/d*100)+'%':'0';
   var c=document.querySelector('.card.now');if(c)cardProg(c);
   if(Date.now()-lastSave>5000){lastSave=Date.now();save(cur.n,P.currentTime)}
-  if(window.onTime)onTime();});
+  if(window.onTime)onTime();
+  if(window.chatTick)chatTick();});
 $('bigplay').onclick=function(){P.play().catch(function(){})};
 $('moments').onclick=function(e){var d=dur(),r=this.getBoundingClientRect();if(d)seek((e.clientX-r.left)/r.width*d)};
 $('share').onclick=function(){if(!cur)return;var b=this,
@@ -1050,12 +1185,58 @@ document.addEventListener('DOMContentLoaded',function(){var q=new URLSearchParam
   select(i,false,isNaN(t)?null:t,true);});
 """
 
-COMMENTS_SIDE = """<aside class="side"><div class="side-in">
-<h3>Comments <em id="ccount"></em></h3><div id="clist"></div>
+CHAT_TAB = '<button type="button" data-tab="chat">Chat replay<em id="chcount"></em></button>'
+CHAT_PANE = """<div class="pane" id="pane-chat"><div id="chlist"></div>
+<div class="chnote">Live chat from this stream, in sync with the video</div></div>"""
+COMMENTS_TAB = '<button type="button" data-tab="comments">Comments<em id="ccount"></em></button>'
+COMMENTS_PANE = """<div class="pane" id="pane-comments"><div id="clist"></div>
 <div class="compose"><div id="cform"><div class="as" id="cas"></div>
 <div class="field"><textarea id="ctext" rows="1" maxlength="500" placeholder="Say something about this moment…"></textarea>
-<button class="btn primary" id="cpost" type="button">Post</button></div></div><div id="cmsg"></div></div>
-</div></aside>"""
+<button class="btn primary" id="cpost" type="button">Post</button></div></div><div id="cmsg"></div></div></div>"""
+
+SIDE_JS = """
+var COLORS=['#ffc857','#7ee0b5','#c49bff','#ff9b85','#8ab4ff','#f78fb3','#9be15d','#5fd3f3'];
+function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
+var _userTab=false;
+function showTab(n,byUser){if(!document.getElementById('pane-'+n))return;if(byUser)_userTab=true;
+  document.querySelectorAll('.tabs button').forEach(function(b){b.classList.toggle('on',b.dataset.tab===n)});
+  document.querySelectorAll('.pane').forEach(function(p){p.hidden=p.id!=='pane-'+n});
+  if(n==='chat'&&window.chatTick)chatTick(true);}
+document.querySelectorAll('.tabs button').forEach(function(b){b.onclick=function(){showTab(b.dataset.tab,true)}});
+showTab(document.querySelector('.tabs button').dataset.tab);
+"""
+
+CHAT_JS = """
+var _chat=[],_ci=0,_chv=null,_chAt=0;
+function chatRow(c){var r=el('div','m'),a=el('span','t',fmt(c.t));a.title='Jump to '+fmt(c.t);a.onclick=function(){seek(c.t)};
+  r.appendChild(a);var n=el('span','who',c.name);n.style.color=COLORS[Math.abs(c.color||0)%COLORS.length];r.appendChild(n);
+  if(c.mod)r.appendChild(el('span','mod','MOD'));r.appendChild(el('p',null,c.text));return r;}
+function chatTick(reset){var l=$('chlist');if(!_chv||!l||l.offsetParent===null&&!reset)return;
+  var now=P.currentTime||0,lo=0,hi=_chat.length;
+  while(lo<hi){var mid=(lo+hi)>>1;if(_chat[mid].t<=now)lo=mid+1;else hi=mid}
+  if(lo===_ci&&!reset)return;
+  var stick=l.scrollHeight-l.scrollTop-l.clientHeight<60;
+  if(reset||_ci===0||lo<_ci||lo-_ci>200){l.textContent='';stick=true;
+    for(var i=Math.max(0,lo-200);i<lo;i++)l.appendChild(chatRow(_chat[i]));}
+  else for(var j=_ci;j<lo;j++)l.appendChild(chatRow(_chat[j]));
+  _ci=lo;
+  if(!lo){l.textContent='';l.appendChild(el('div','cempty',_chat.length?
+    'Chat from this stream shows up here as the video plays.':'No chat was saved for this stream.'));}
+  while(l.children.length>300)l.removeChild(l.firstChild);
+  if(stick)l.scrollTop=l.scrollHeight;}
+function fetchChat(name,first){_chAt=Date.now();
+  return fetch('/vods/api/chat?vod='+encodeURIComponent(name),{credentials:'same-origin'}).then(function(r){return r.json()})
+  .then(function(d){if(name!==_chv)return;var grew=(d.chat||[]).length!==_chat.length;_chat=d.chat||[];
+    $('chcount').textContent=_chat.length||'';
+    if(first&&!_userTab)showTab(_chat.length||!$('pane-comments')?'chat':'comments');
+    if(first||grew)chatTick(first);})
+  .catch(function(){if(first){var l=$('chlist');l.textContent='';l.appendChild(el('div','cempty','Could not load chat.'))}});}
+function loadChat(name){_chv=name;_chat=[];_ci=0;$('chcount').textContent='';
+  var l=$('chlist');l.textContent='';l.appendChild(el('div','cempty','Loading\\u2026'));fetchChat(name,true);}
+P.addEventListener('seeked',function(){chatTick(true)});
+// The VOD being recorded keeps gaining chat.
+setInterval(function(){if(cur&&cur.rec&&_chv===cur.n&&Date.now()-_chAt>25000)fetchChat(cur.n,false)},5000);
+"""
 
 COMMENTS_JS = """
 var _vod=null,_me=null,_admin=false,_open=true;
@@ -1065,14 +1246,12 @@ var CERR={no_chat:'To comment, open the chat on the live page once so Owncast gi
   slow_down:'Slow down a little.',rate_limited:'Too many attempts. Try again later.',
   length:'Comments must be 1-500 characters.',full:'This VOD has reached its comment limit.',
   chat_unreachable:'Couldn\\'t reach chat to check your name. Try again later.'};
-var COLORS=['#ffc857','#7ee0b5','#c49bff','#ff9b85','#8ab4ff','#f78fb3','#9be15d','#5fd3f3'];
 function chatToken(){try{var t=localStorage.getItem('accessToken')||'';
   try{var j=JSON.parse(t);if(typeof j==='string')t=j;}catch(e){}
   return /^[A-Za-z0-9_+\\/=.-]+$/.test(t)?t:'';}catch(e){return '';}}
 function capi(url,body){var o={headers:{'X-Chat-Token':chatToken()},credentials:'same-origin'};
   if(body){o.method='POST';o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
   return fetch(url,o).then(function(r){return r.json().then(function(d){return {status:r.status,d:d}})});}
-function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
 function cmsg(t){$('cmsg').textContent=t||'';}
 function onTime(){var a=$('cas');if(!_open)return;a.textContent='';
   if(_me){a.appendChild(document.createTextNode('Commenting as '));a.appendChild(el('b',null,_me.name));}
@@ -1139,7 +1318,11 @@ function doLogin(){
 
 
 def _vod_start(v) -> float:
-    """Start time of a VOD (local time zone) from its file name."""
+    """Start time of a VOD (local time zone) from its file name, to the second."""
+    m = FILE_RE.match(v.get("name", ""))
+    if m:
+        return time.mktime(time.strptime(f"{m.group(1)} {m.group(2)}{m.group(3)}{m.group(4)}",
+                                         "%Y-%m-%d %H%M%S"))
     return time.mktime(time.strptime(f'{v["date"]} {v["start"]}', "%Y-%m-%d %H:%M"))
 
 
@@ -1262,7 +1445,13 @@ def render_page(authed: bool = False, embed: bool = False, host: str = ""):
     stage = ""
     if vods:
         tags = "".join(f'<span class="tag">#{html.escape(t)}</span>' for t in info.get("tags", []))
-        stage = _fill(STAGE, SOLO="" if COMMENTS else " solo", SIDE=COMMENTS_SIDE if COMMENTS else "",
+        side = ""
+        if COMMENTS or CHAT_REPLAY:
+            side = ('<aside class="side"><div class="side-in"><div class="tabs">'
+                    + (CHAT_TAB if CHAT_REPLAY else "") + (COMMENTS_TAB if COMMENTS else "") + "</div>"
+                    + (CHAT_PANE if CHAT_REPLAY else "") + (COMMENTS_PANE if COMMENTS else "")
+                    + "</div></aside>")
+        stage = _fill(STAGE, SOLO="" if side else " solo", SIDE=side,
                       LOGO=logo, TAGS=f'<div class="tags">{tags}</div>' if tags else "",
                       DL_LABEL="🔒 Download" if gated else "⬇ Download")
 
@@ -1288,6 +1477,8 @@ def render_page(authed: bool = False, embed: bool = False, host: str = ""):
         GATED="true" if gated else "false",
         PAGE_JS=PAGE_JS if vods else "",
         LOGIN_JS=LOGIN_JS if gated and vods else "",
+        SIDE_JS=SIDE_JS if (COMMENTS or CHAT_REPLAY) and vods else "",
+        CHAT_JS=CHAT_JS if CHAT_REPLAY and vods else "",
         COMMENTS_JS=COMMENTS_JS if COMMENTS and vods else "",
     ).encode()
 
@@ -1335,6 +1526,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"comments": load_comments(name), "open": not rec.online,
                                     "me": me, "admin": _is_admin(self)},
                               extra={"Cache-Control": "no-store"})
+        if path == "/vods/api/chat" and CHAT_REPLAY:
+            name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("vod", [""])[0]
+            if not vod_exists(name):
+                return self._json(404, {"error": "not_found"})
+            return self._json(200, {"chat": load_chat(name)}, extra={"Cache-Control": "no-store"})
         # /vods/download/<name>  — gated download (triggers Content-Disposition)
         if path.startswith("/vods/download/"):
             if not _download_allowed(self):
@@ -1403,29 +1599,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self.post_comment()
             except CommentError as e:
                 return self._json(e.code, {"ok": False, "error": e.err})
-        # ---- Owncast webhook: STREAM_STARTED / STREAM_STOPPED ----
+        # ---- Owncast webhook: STREAM_STARTED / STREAM_STOPPED / CHAT / VISIBILITY-UPDATE ----
         if u.path not in ("/webhook", "/vods/webhook"):
             return self._send(404, b"not found")
         token = urllib.parse.parse_qs(u.query).get("token", [""])[0]
         if WEBHOOK_TOKEN and not hmac.compare_digest(token.encode(), WEBHOOK_TOKEN.encode()):
             return self._send(403, b"bad token")
-        n = int(self.headers.get("Content-Length") or 0)
+        body = self._json_body(65536)
+        event = str(body.get("type", ""))
+        data = body.get("eventData") if isinstance(body.get("eventData"), dict) else {}
         try:
-            event = json.loads(self.rfile.read(n) or b"{}").get("type", "")
-        except ValueError:
-            event = ""
-        log("webhook", event or "(unknown)")
-        if event in ("STREAM_STARTED", "STREAM_STOPPED"):
-            rec.wake.set()  # re-check status now instead of waiting for poll
+            if event == "CHAT":
+                record_chat(data)  # not logged: one line per chat message is too much
+            elif event == "VISIBILITY-UPDATE":
+                set_chat_visibility(data.get("ids") if isinstance(data.get("ids"), list) else [],
+                                    bool(data.get("visible")))
+            else:
+                log("webhook", event or "(unknown)")
+                if event in ("STREAM_STARTED", "STREAM_STOPPED"):
+                    rec.wake.set()  # re-check status now instead of waiting for poll
+        except Exception:
+            log("webhook", event, "failed:\n" + traceback.format_exc())
         self._send(200, b"ok")
 
     def _json(self, code, obj, extra=None):
         self._send(code, json.dumps(obj).encode(), "application/json", extra)
 
-    def _json_body(self) -> dict:
+    def _json_body(self, limit: int = 16384) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
         try:
-            body = json.loads(self.rfile.read(min(n, 16384)) or b"{}")
+            body = json.loads(self.rfile.read(min(n, limit)) or b"{}")
         except ValueError:
             return {}
         return body if isinstance(body, dict) else {}

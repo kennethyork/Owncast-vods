@@ -2,3 +2,6 @@
 vods/
 __pycache__/
 rclone/
+.run/
+*.log
+*.log.1
