@@ -1490,7 +1490,8 @@ def render_page(authed: bool = False, embed: bool = False, host: str = "", viewe
                   else '<span class="status"><i></i>Offline</span>')
         header = (f'<header><a href="{live}"><img class="logo" src="{logo}" alt="" onerror="this.remove()"></a>'
                   f'<div class="brand"><b>{html.escape(site)}</b><span>{html.escape(host)}</span></div>{status}'
-                  f'<nav><a href="{live}">Live</a><a class="on" href="/vods">VODs</a>{links}</nav></header>')
+                  f'<nav><a href="{live}">Live</a><a class="on" href="/vods">VODs</a>{links}'
+                  f'{"<a href=/admin>Admin</a>" if ADMIN_PASSWORD else ""}</nav></header>')
         parts = [html.escape(site), f'<a href="{live}">Watch live</a>'] + extra
         footer = "<footer>" + " · ".join(parts) + "</footer>"
 
@@ -1538,6 +1539,122 @@ def render_page(authed: bool = False, embed: bool = False, host: str = "", viewe
         COMMENTS_JS=COMMENTS_JS if COMMENTS and vods else "",
         LIKE_JS=LIKE_JS if LIKES and vods else "",
     ).encode()
+
+
+# ── Admin login page (/admin — shown when not authenticated) ─────────────────
+
+_ADMIN_LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin login</title><style>
+body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;
+     display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{background:#1e1e1e;padding:32px;border-radius:12px;min-width:280px;text-align:center}
+h2{margin:0 0 20px;font-size:1.1rem}
+input{width:100%;padding:9px;border:1px solid #444;border-radius:6px;
+      background:#111;color:#eee;font-size:1rem;box-sizing:border-box}
+button{margin-top:14px;width:100%;padding:10px;background:#8ab4f8;color:#000;
+       border:0;border-radius:6px;font-size:1rem;cursor:pointer;font-weight:600}
+.err{color:#f55;font-size:.85rem;margin-top:10px;min-height:1em}
+</style></head><body>
+<div class="box">
+<h2>Admin login</h2>
+<input id="pw" type="password" placeholder="Password" autocomplete="current-password">
+<button onclick="doLogin()">Log in</button>
+<div class="err" id="err"></div>
+</div>
+<script>
+document.getElementById('pw').addEventListener('keydown',function(e){if(e.key==='Enter')doLogin();});
+setTimeout(function(){document.getElementById('pw').focus();},50);
+function doLogin(){
+  var pw=document.getElementById('pw').value;
+  fetch('/vods/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({password:pw})})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.ok){location.href='/admin';}
+    else{document.getElementById('err').textContent='Wrong password.';}
+  });
+}
+</script></body></html>"""
+
+
+def render_admin():
+    """Full CRUD admin dashboard — only served to authenticated admins."""
+    vods = merged_vods()
+    rows, day = [], None
+    for v in vods:
+        if v["date"] != day:
+            day = v["date"]
+            rows.append(f'<div style="margin-top:18px;color:#aaa;font-size:.9rem;'
+                        f'border-bottom:1px solid #333;padding-bottom:4px">{day}</div>')
+        name = v["name"]
+        f = html.escape(name)
+        is_cloud = v.get("cloud", False)
+        has_thumb = v.get("thumb", False)
+        recording = v.get("recording", False)
+        thumb_src = f"/vods/thumb/{f[:-4]}.jpg" if has_thumb else ""
+        if has_thumb:
+            thumb_html = f'<img style="width:120px;height:68px;object-fit:cover;border-radius:4px;background:#222;flex-shrink:0" src="{thumb_src}" alt="" loading="lazy">'
+        else:
+            thumb_html = '<div style="width:120px;height:68px;border-radius:4px;background:#1a1a1a;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:1.6rem;color:#444">▶</div>'
+        data_th = f' data-th="{thumb_src}"' if has_thumb else ""
+        live_badge = '<span style="color:#f55;font-weight:600">● recording</span> ' if recording else ""
+        cloud_badge = '<span style="color:#8ab4f8;font-size:.8rem">☁ cloud</span> ' if is_cloud else ""
+        player_src = f"/vods/cloud/{f}" if is_cloud else f"/vods/{f}"
+        dl_href = f"/vods/cloud/{f}?dl=1" if is_cloud else f"/vods/download/{f}"
+        dl_btn = (f'<a style="padding:5px 11px;border-radius:5px;background:#8ab4f8;color:#000;'
+                  f'text-decoration:none;font-size:.85rem;font-weight:600" '
+                  f'href="{dl_href}" download>⬇ Download</a>')
+        if recording or is_cloud:
+            del_btn = ""
+        else:
+            del_btn = (f'<button style="padding:5px 11px;border-radius:5px;background:#c0392b;'
+                       f'color:#fff;border:0;cursor:pointer;font-size:.85rem;font-weight:600" '
+                       f'onclick="delVod(\'{f}\',this)">🗑 Delete</button>')
+        rows.append(
+            f'<div style="display:flex;align-items:center;gap:12px;padding:8px;border-radius:6px;cursor:pointer" '
+            f'data-f="{player_src}"{data_th} id="row-{f}" '
+            f'onclick="if(event.target.tagName===\'A\'||event.target.closest(\'button\')||event.target.closest(\'a\'))return;'
+            f'var p=document.getElementById(\'p\'),th=this.dataset.th||\'\';'
+            f'p.style.display=\'block\';if(th)p.poster=th;else p.removeAttribute(\'poster\');'
+            f'p.src=this.dataset.f;p.play();scrollTo(0,0);">'
+            f'{thumb_html}'
+            f'<div style="flex:1;min-width:0">'
+            f'<div style="font-size:.95rem">▶ {v["date"]} {v["start"]} {live_badge}{cloud_badge}</div>'
+            f'<div style="color:#888;font-size:.85rem">{human(v["size"])}</div>'
+            f'</div>'
+            f'<div style="margin-left:auto;white-space:nowrap;display:flex;gap:8px;align-items:center">'
+            f'{dl_btn}{del_btn}</div>'
+            f'</div>'
+        )
+    body = "\n".join(rows) if rows else "<p style='color:#888'>No VODs yet.</p>"
+    t = html.escape(TITLE)
+    return (f'<!doctype html><html><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>Admin – {t}</title><style>'
+            f'body{{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px;max-width:960px;margin:auto}}'
+            f'h1{{font-size:1.3rem}} a{{color:#8ab4f8}}'
+            f'video{{width:100%;background:#000;border-radius:8px;display:none;margin-bottom:12px}}'
+            f'</style></head><body>'
+            f'<h1>Admin – {t} '
+            f'<span style="font-size:.8rem;font-weight:400">'
+            f'<a href="/vods">← public page</a>&nbsp;&nbsp;'
+            f'<a href="/admin/logout" style="color:#888">log out</a>'
+            f'</span></h1>'
+            f'<video id="p" controls playsinline></video>'
+            f'{body}'
+            f'<script>'
+            f'function delVod(name,btn){{'
+            f'if(!confirm("Delete "+name+"?"))return;'
+            f'btn.disabled=true;btn.textContent="Deleting…";'
+            f'fetch("/admin/delete",{{method:"POST",'
+            f'headers:{{"Content-Type":"application/json"}},'
+            f'body:JSON.stringify({{name:name}})}}).then(function(r){{return r.json();}}).then(function(d){{'
+            f'if(d.ok){{var row=document.getElementById("row-"+name);if(row)row.remove();}}'
+            f'else{{btn.disabled=false;btn.textContent="🗑 Delete";alert(d.error||"Delete failed");}}'
+            f'}}).catch(function(){{btn.disabled=false;btn.textContent="🗑 Delete";alert("Network error");}});'
+            f'}}'
+            f'</script>'
+            f'</body></html>').encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1599,6 +1716,20 @@ class Handler(BaseHTTPRequestHandler):
             if not 2 <= len(q) <= 100:
                 return self._json(400, {"error": "bad_query"})
             return self._json(200, {"results": search_vods(q)}, extra={"Cache-Control": "no-store"})
+        # ---- admin pages ----
+        if path in ("/admin", "/admin/"):
+            if not _download_allowed(self):
+                return self._send(200, _ADMIN_LOGIN_PAGE.encode(), "text/html; charset=utf-8")
+            return self._send(200, render_admin(), "text/html; charset=utf-8",
+                              extra={"Cache-Control": "no-store"})
+        if path == "/admin/logout":
+            self.send_response(302)
+            self.send_header("Location", "/admin")
+            self.send_header("Set-Cookie",
+                "vod_admin=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         # /vods/download/<name>  — gated download (triggers Content-Disposition)
         if path.startswith("/vods/download/"):
             if not _download_allowed(self):
