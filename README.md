@@ -405,7 +405,10 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `SMTP_PASS` | – | SMTP password / app password |
 | `SMTP_FROM` | `SMTP_USER` | Sender address (defaults to `SMTP_USER`) |
 | `NOTIFY_TO` | – | Comma-separated recipient addresses |
-| `NOTIFY_URL` | `LIVE_URL` | Base URL shown in the notification email |
+| `NOTIFY_URL` | `LIVE_URL` | Full site URL used for links in notifications |
+| `DISCORD_WEBHOOK` | – | Discord webhook URL; posts each finished VOD (empty = off) |
+| `NTFY_URL` | – | ntfy topic URL for phone push, e.g. `https://ntfy.sh/my-topic` (empty = off) |
+| `NTFY_TOKEN` | – | Access token for a protected ntfy topic |
 | `BACKUP_REMOTE` | `dropbox` | rclone remote name |
 | `BACKUP_FOLDER` | `Owncast VODs` | Folder (or bucket/folder) on the remote |
 | `BACKUP_INTERVAL_MIN` | `15` | Minutes between upload runs |
@@ -521,6 +524,25 @@ For **Gmail** you need an [App Password](https://myaccount.google.com/apppasswor
 (requires 2-Step Verification). For other providers, check their SMTP docs.
 
 Leave `SMTP_HOST` empty to disable email notifications entirely.
+
+### Discord and phone (ntfy) notifications
+
+No email account needed. Set either or both; each finished VOD is announced
+once (same `.notified.json` list as email) with its title, date, length,
+thumbnail and a link that opens that VOD directly.
+
+```env
+NOTIFY_URL=https://stream.example.com            # full URL, used for the links
+DISCORD_WEBHOOK=https://discord.com/api/webhooks/...   # channel → Integrations → Webhooks
+NTFY_URL=https://ntfy.sh/my-vods-k3x9q2          # topic you subscribed to in the ntfy app
+```
+
+- **Discord:** in your server, open a channel's settings → Integrations →
+  Webhooks → New Webhook → Copy Webhook URL.
+- **ntfy:** install the free ntfy app (Android/iOS), tap +, and subscribe to a
+  topic on `ntfy.sh`. Topics are public to anyone who knows the name, so pick
+  something hard to guess. For a protected or self-hosted topic, also set
+  `NTFY_TOKEN`.
 
 ---
 

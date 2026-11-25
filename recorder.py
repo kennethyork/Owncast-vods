@@ -76,6 +76,11 @@ SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)   # defaults to SMTP_USER
 NOTIFY_TO = os.environ.get("NOTIFY_TO", "")          # comma-separated recipients
 NOTIFY_URL = os.environ.get("NOTIFY_URL", LIVE_URL)  # link in the email body
 
+# ---- Push notifications (no email account needed) ----
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")  # channel → Integrations → Webhooks
+NTFY_URL = os.environ.get("NTFY_URL", "").rstrip("/")    # e.g. https://ntfy.sh/my-secret-topic
+NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "")            # only for protected ntfy topics
+
 FILE_RE = re.compile(r"^vod_(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})\.mp4$")
 
 # ---------------------------------------------------- auth helpers ----------
@@ -776,7 +781,7 @@ def make_thumb_bg(vod_name: str):
     threading.Thread(target=make_thumb, args=(vod_name,), daemon=True).start()
 
 
-# ------------------------------------------------------- email notify -------
+# ------------------------------------------------------- notifications ------
 def send_email(vod: dict):
     """Send a notification email when a VOD finishes. No-op if SMTP not configured."""
     if not (SMTP_HOST and NOTIFY_TO and SMTP_USER):
@@ -838,8 +843,71 @@ def send_email(vod: dict):
         log("email failed:", e)
 
 
+UA = "owncast-vods (https://github.com/kennethyork/Owncast-vods)"  # Discord rejects urllib's default
+
+
+def _post_json(url: str, body: dict, headers: dict = None):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={
+        "Content-Type": "application/json", "User-Agent": UA, **(headers or {})})
+    urllib.request.urlopen(req, timeout=15).close()
+
+
+def send_push(vod: dict):
+    """Post a finished VOD to Discord and/or ntfy. No-op if neither is set."""
+    if not (DISCORD_WEBHOOK or NTFY_URL):
+        return
+    name = vod["name"]
+    # The thumbnail is made in parallel when the VOD finishes; give it a moment.
+    for _ in range(30):
+        if not THUMB_ENABLED or thumb_path(name).exists():
+            break
+        time.sleep(3)
+    site = owncast_info().get("name") or TITLE
+    title = load_titles().get(name, "")
+    clock = _clock(vod["start"])
+    if _norm(title) in ("", _norm(site)):
+        title = f"Stream · {clock}"
+    t = time.strptime(vod["date"], "%Y-%m-%d")
+    when = f'{time.strftime("%A, %B", t)} {t.tm_mday} · {clock}'
+    secs = _duration(vod)
+    if secs:
+        when += f" · {_length(secs)}"
+    base = NOTIFY_URL.rstrip("/")
+    link = f"{base}/vods?v={urllib.parse.quote(name)}"
+    thumb = f"{base}/vods/thumb/{name[:-4]}.jpg" if thumb_path(name).exists() else ""
+
+    if DISCORD_WEBHOOK:
+        embed = {"title": f"New VOD: {title}"[:256], "url": link, "description": when, "color": 0xF5B942}
+        if thumb:
+            embed["image"] = {"url": thumb}
+        try:
+            _post_json(DISCORD_WEBHOOK, {"username": site[:80], "embeds": [embed]})
+            log("discord notified for", name)
+        except Exception as e:
+            log("discord notify failed:", e)
+
+    if NTFY_URL:
+        # JSON publishing (POST to the server root) keeps emoji/accents in titles intact.
+        u = urllib.parse.urlsplit(NTFY_URL)
+        msg = {"topic": u.path.rsplit("/", 1)[-1], "title": f"{site}: new VOD",
+               "message": f"{title}\n{when}", "click": link, "tags": ["movie_camera"]}
+        if thumb:
+            msg["attach"] = thumb
+        try:
+            _post_json(f"{u.scheme}://{u.netloc}", msg,
+                       {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else None)
+            log("ntfy notified for", name)
+        except Exception as e:
+            log("ntfy notify failed:", e)
+
+
+def notify(vod: dict):
+    send_email(vod)
+    send_push(vod)
+
+
 def notify_bg(vod: dict):
-    threading.Thread(target=send_email, args=(vod,), daemon=True).start()
+    threading.Thread(target=notify, args=(vod,), daemon=True).start()
 
 
 # ---------------------------------------------------------- cloud listing ----
@@ -1827,8 +1895,8 @@ def main():
     log(f"owncast-vod: {OWNCAST_URL}, chunks={SEGMENT_SECONDS}s, dir={VOD_DIR}, port={PORT}")
     if WEBHOOK_TOKEN.startswith("change-me") or ADMIN_PASSWORD.startswith("change-me"):
         log("WARNING: WEBHOOK_TOKEN / ADMIN_PASSWORD still use the example value - change them in .env")
-    if SMTP_HOST and not NOTIFY_URL.startswith(("http://", "https://")):
-        log("WARNING: NOTIFY_URL should be a full URL (https://...) or email links won't work")
+    if (SMTP_HOST or DISCORD_WEBHOOK or NTFY_URL) and not NOTIFY_URL.startswith(("http://", "https://")):
+        log("WARNING: NOTIFY_URL should be a full URL (https://...) or notification links won't work")
     threading.Thread(target=rec.loop, daemon=True).start()
 
     def shutdown(*_):
