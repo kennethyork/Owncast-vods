@@ -401,6 +401,7 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `LIKES` | `1` | `0` turns off the like button |
 | `THUMB_ENABLED` | `1` | `0` disables thumbnail generation |
 | `THUMB_OFFSET` | `60` | Seconds into the VOD to grab the thumbnail frame |
+| `FASTSTART` | `1` | Rewrite finished VODs as regular MP4 with the index up front, so players load and seek instantly. Copies streams (no re-encode); needs free space equal to one VOD while it runs |
 | `BACKUP_REMOTE` | `dropbox` | rclone remote name |
 | `BACKUP_FOLDER` | `Owncast VODs` | Folder (or bucket/folder) on the remote |
 | `BACKUP_INTERVAL_MIN` | `15` | Minutes between upload runs |

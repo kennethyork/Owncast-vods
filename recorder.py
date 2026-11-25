@@ -65,6 +65,9 @@ NAV_LINKS = [tuple(p.split("|", 1)) for p in os.environ.get("NAV_LINKS", "").spl
 # Set to "" to disable thumbnail generation.
 THUMB_ENABLED = os.environ.get("THUMB_ENABLED", "1") not in ("0", "false", "no", "")
 THUMB_OFFSET = int(os.environ.get("THUMB_OFFSET", "60"))  # seconds into VOD to grab
+# Rewrite finished VODs as regular MP4 with the index up front, so players
+# know the length and can seek instantly (fragmented MP4 has to be scanned).
+FASTSTART = os.environ.get("FASTSTART", "1") not in ("0", "false", "no", "")
 
 FILE_RE = re.compile(r"^vod_(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})\.mp4$")
 
@@ -672,6 +675,9 @@ class Recorder:
             if not v["thumb"] and name not in thumb_tried:
                 thumb_tried.add(name)
                 make_thumb_bg(name)
+            # mtime check: give ffmpeg time to close the file after a split
+            if FASTSTART and name not in _fast_tried and time.time() - v["mtime"] > 30:
+                _fast_queue_add(name)
 
 
 rec = Recorder()
@@ -811,6 +817,100 @@ def make_thumb(vod_name: str):
 def make_thumb_bg(vod_name: str):
     """Kick off thumbnail generation in a daemon thread."""
     threading.Thread(target=make_thumb, args=(vod_name,), daemon=True).start()
+
+
+# ----------------------------------------------------------- faststart ------
+_fast_tried: set = set()  # names checked or rewritten this run
+_fast_pending: list = []
+_fast_lock = threading.Lock()
+_fast_busy = False
+
+
+def is_fragmented(path: Path) -> bool:
+    """True if the MP4 has movie fragments before any plain media data,
+    i.e. it is still in the recorder's fragmented form."""
+    try:
+        with open(path, "rb") as f:
+            for _ in range(16):
+                head = f.read(8)
+                if len(head) < 8:
+                    return False
+                size, kind = int.from_bytes(head[:4], "big"), head[4:]
+                if kind == b"moof":
+                    return True
+                if kind == b"mdat":
+                    return False
+                if size == 1:
+                    size = int.from_bytes(f.read(8), "big")
+                    f.seek(size - 16, 1)
+                elif size >= 8:
+                    f.seek(size - 8, 1)
+                else:
+                    return False
+    except OSError:
+        return False
+    return False
+
+
+def faststart(vod_name: str):
+    """Remux a finished fragmented VOD to a regular MP4 (no re-encode),
+    keeping its modification time so length and retention still work."""
+    src = VOD_DIR / vod_name
+    if not src.exists() or not is_fragmented(src):
+        return
+    st = src.stat()
+    if shutil.disk_usage(VOD_DIR).free < st.st_size + MIN_FREE_GB * 1e9:
+        log("faststart skipped for", vod_name, "(not enough free space)")
+        return
+    tmp = VOD_DIR / ("." + vod_name + ".tmp")  # dot name: hidden from list and backup
+    t0 = time.time()
+    try:
+        result = subprocess.run(
+            [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin",
+             "-i", str(src), "-map", "0", "-c", "copy",
+             "-movflags", "+faststart", "-f", "mp4", "-y", str(tmp)],
+            timeout=1800, capture_output=True)
+        ok = (result.returncode == 0 and tmp.exists()
+              and tmp.stat().st_size > st.st_size * 0.9)
+        if not ok:
+            log("faststart failed for", vod_name, result.stderr.decode(errors="replace")[:200])
+            return
+        if not src.exists():  # deleted meanwhile (admin page)
+            return
+        os.utime(tmp, (st.st_atime, st.st_mtime))
+        tmp.replace(src)
+        log(f"faststart: {vod_name} ready for instant seeking ({time.time() - t0:.0f} s)")
+    except Exception as e:
+        log("faststart error:", vod_name, e)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _fast_worker():
+    global _fast_busy
+    while True:
+        with _fast_lock:
+            if not _fast_pending:
+                _fast_busy = False
+                return
+            name = _fast_pending.pop(0)
+        faststart(name)
+
+
+def _fast_queue_add(name: str):
+    """Queue a VOD for faststart; one ffmpeg at a time, newest first."""
+    global _fast_busy
+    _fast_tried.add(name)
+    with _fast_lock:
+        _fast_pending.append(name)
+        _fast_pending.sort(reverse=True)
+        if not _fast_busy:
+            _fast_busy = True
+            threading.Thread(target=_fast_worker, daemon=True).start()
 
 
 # ---------------------------------------------------------- cloud listing ----
