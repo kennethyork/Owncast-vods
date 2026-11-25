@@ -18,6 +18,8 @@ Made for 24/7 streams, but it works for regular streams too.
   within 15 seconds.
 - **VOD page.** Grouped by day, with a built-in player, seeking, downloads and a
   JSON API. Add it to Owncast as a button for viewers.
+- **Comments with chat names.** Viewers comment under VODs as their Owncast
+  chat name, no extra account needed. Owncast moderators can delete comments.
 - **Manages disk space.** Deletes old VODs after N days, or sooner when the
   disk runs low.
 - **Cloud backup.** Optional: copies every finished VOD to the cloud.
@@ -222,8 +224,7 @@ A proxy inside a container can't reach the host's `127.0.0.1`. In `.env`, set
 ### Separate subdomain instead
 
 Point e.g. `vods.example.com` at `127.0.0.1:8090` as a normal proxy host. The
-page is at `vods.example.com/vods`, and `/` redirects there. Set
-`LIVE_URL=https://stream.example.com` so "back to live" works.
+page is at `vods.example.com/vods`, and `/` redirects there.
 
 When it's set up, open **`https://stream.example.com/vods`**.
 
@@ -241,11 +242,22 @@ In the Owncast admin (`/admin`) → **Integrations**:
 - **Open in new tab:** off shows the page as a pop-up over the stream; on
   opens the full page.
 
-### Instant start/stop (Webhook, recommended)
+### Instant start/stop and chat replay (Webhook, recommended)
 
 **Webhooks → Create webhook**
 - **URL:** `https://stream.example.com/vods/webhook?token=YOUR_WEBHOOK_TOKEN`
-- **Events:** **Stream Started** and **Stream Stopped**
+- **Events:** **Stream Started**, **Stream Stopped**, **Chat Message** and
+  **Message Visibility Changed** (the last two are for chat replay)
+
+Or let a script do it. On the Owncast server, in this folder:
+
+```bash
+python3 owncast-webhook.py https://stream.example.com
+```
+
+It asks for the Owncast admin password, reads `WEBHOOK_TOKEN` from `.env`, and
+replaces an existing `/vods/webhook` entry (Owncast can't edit a webhook's
+events). Other webhooks are left alone.
 
 Test it: stop and restart your broadcast, then run `docker compose logs vods`
 and look for `webhook STREAM_STOPPED` / `webhook STREAM_STARTED`.
@@ -256,7 +268,8 @@ and look for `webhook STREAM_STOPPED` / `webhook STREAM_STARTED`.
 
 A second container uses [rclone](https://rclone.org) to copy every
 **finished** VOD to cloud storage. It runs every 15 minutes and skips the file
-still being recorded. It only **copies**: VODs deleted locally by
+still being recorded, along with each VOD's thumbnail, chat replay, comments,
+likes and stream title. It only **copies**: VODs deleted locally by
 `RETENTION_DAYS` stay in the cloud. Use `BACKUP_RETENTION_DAYS` to clean the
 cloud side too.
 
@@ -374,8 +387,9 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `VOD_PATH` | `./vods` | Folder on the host for VOD files |
 | `RETENTION_DAYS` | `14` | Delete local VODs after N days (`0` = never) |
 | `MIN_FREE_GB` | `5` | Delete the oldest VODs when free space drops below this |
-| `TITLE` | `Stream VODs` | Heading on the VOD page |
-| `LIVE_URL` | `/` | Where "back to live" links |
+| `TITLE` | `Stream VODs` | Page name if Owncast's name can't be read |
+| `LIVE_URL` | `/` | Your stream page; the logo comes from `LIVE_URL/logo` |
+| `NAV_LINKS` | – | Extra header links, e.g. `Games\|https://games.example.com` |
 | `PORT` | `8090` | VOD page port |
 | `BIND` | `127.0.0.1` | `0.0.0.0` to listen on all interfaces |
 | `WEBHOOK_TOKEN` | – | Required `?token=` on the webhook URL |
@@ -383,24 +397,85 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `COMPOSE_PROFILES` | – | `backup` turns on cloud backup |
 | `CLOUD_PORT` | `8091` | WebDAV port inside the backup container |
 | `CLOUD_URL` | – | `http://127.0.0.1:8091` enables cloud playback on /vods |
+| `COMMENTS` | `1` | `0` turns off VOD comments |
+| `LIKES` | `1` | `0` turns off the like button |
 | `THUMB_ENABLED` | `1` | `0` disables thumbnail generation |
 | `THUMB_OFFSET` | `60` | Seconds into the VOD to grab the thumbnail frame |
-| `SMTP_HOST` | – | SMTP server for email notifications (empty = off) |
-| `SMTP_PORT` | `587` | `465` for implicit TLS; `587` for STARTTLS |
-| `SMTP_USER` | – | SMTP login username |
-| `SMTP_PASS` | – | SMTP password / app password |
-| `SMTP_FROM` | `SMTP_USER` | Sender address (defaults to `SMTP_USER`) |
-| `NOTIFY_TO` | – | Comma-separated recipient addresses |
-| `NOTIFY_URL` | `LIVE_URL` | Base URL shown in the notification email |
 | `BACKUP_REMOTE` | `dropbox` | rclone remote name |
 | `BACKUP_FOLDER` | `Owncast VODs` | Folder (or bucket/folder) on the remote |
 | `BACKUP_INTERVAL_MIN` | `15` | Minutes between upload runs |
 | `BACKUP_RETENTION_DAYS` | `0` | Delete from the remote after N days (`0` = never) |
 
-**Endpoints:** `/vods` (page), `/vods/<file>.mp4` (video stream, no auth),
+**Endpoints:** `/vods` (page), `/vods/<file>.mp4` (video stream; needs the
+page's signed link when `ADMIN_PASSWORD` is set),
 `/vods/download/<file>.mp4` (download, gated by `ADMIN_PASSWORD`),
 `/vods/login` (POST, sets session cookie), `/vods/api/list` (JSON),
-`/vods/webhook` (Owncast webhook).
+`/vods/api/comments?vod=<file>.mp4` (comments, JSON; POST to add,
+POST `/vods/api/comments/delete` to remove), `/vods/api/like` (POST
+`{"vod", "like": true|false}`), `/vods/webhook` (Owncast webhook).
+
+### Comments
+
+Viewers can comment under each VOD, signed with their **Owncast chat name**.
+There's nothing to sign up for: the page reuses the chat identity the browser
+already has from your Owncast page. That only works when `/vods` is served on
+the **same domain** as Owncast (the setups in section 5). A separate subdomain
+won't see the chat identity.
+
+- **Posting is only open while the stream is offline.** Owncast has no API to
+  look up a chat user, so the recorder checks a viewer's name by briefly
+  connecting to chat. While live, that would post "X joined the chat" and fire
+  a join webhook, so comments close during streams and reopen when they end.
+- Someone who has never opened chat has no chat name yet. The page tells them
+  to open chat on the live page once.
+- Each check is remembered for an hour. When the check disconnects, Owncast
+  still sends a **user parted** webhook (and shows "X left the chat" if
+  join/part messages are on), so expect at most one per commenter per hour.
+- Users banned in Owncast can't comment. Owncast moderators, the admin (logged
+  in with `ADMIN_PASSWORD`) and each comment's author can delete it.
+- Comments can be clicked to jump to the moment in the video they were posted
+  at. They're limited to 500 characters, one every 10 seconds per user.
+- Stored next to each VOD as `vod_*.comments.json`, and deleted with the VOD
+  unless cloud playback (`CLOUD_URL`) is on, in which case they stay for the
+  cloud copy.
+
+### Likes
+
+Each VOD has a **♥ Like** button next to Share, and every card in the grid
+shows its like count. No login is needed: the page gives each browser a random
+`vod_viewer` cookie, and that browser can like a VOD once (click again to
+unlike). To stop one person inflating a count by clearing cookies, at most 5
+likes per VOD are accepted from the same IP address. Likes are stored as
+`vod_*.likes.json` next to each VOD (hashed, no IPs in plain text) and deleted
+with the VOD unless cloud playback is on. `LIKES=0` in `.env` turns them off.
+
+### Search
+
+The search box above the VOD grid filters as you type:
+
+- **Titles and dates** match in the browser: `aehelgard`, `november 20`,
+  `friday`, `yesterday`, `6:05 pm`.
+- **Chat replay and comments** are searched on the server and listed above the
+  grid as moments ("1:13:42 · Fri, Nov 20 · chat · Ada: Brickport harbour…").
+  Click one to play that VOD from that moment. All words must appear; case
+  doesn't matter; up to 60 results, newest VOD first. Hidden chat messages
+  never show up.
+- The search is kept in the address bar (`/vods?q=harbour`), so a search can
+  be shared as a link.
+
+### Chat replay
+
+The live chat is saved with each VOD and plays back beside the video, in sync,
+like a Twitch replay. It needs the **Chat Message** event on the webhook
+(section 6); **Message Visibility Changed** makes messages a moderator hides
+disappear from the replay too.
+
+- Only chat sent while a VOD is recording is saved. VODs recorded before you
+  added the webhook events have no chat.
+- Click a message's timestamp to jump there. Seeking moves the chat with you.
+- Stored as `vod_*.chat.jsonl` next to each VOD (up to 50,000 messages), and
+  deleted with the VOD unless cloud playback (`CLOUD_URL`) is on.
+- `CHAT_REPLAY=0` in `.env` turns it off.
 
 ### Admin downloads
 
@@ -413,8 +488,16 @@ ADMIN_PASSWORD=supersecretpassword
 
 After setting it, the download link on `/vods` becomes a 🔒 button.
 Click it → enter the password → the browser downloads the file.
-The session lasts 24 hours (one cookie, no database needed).
+The session lasts 24 hours and survives container restarts (the signing key
+is kept in `VOD_PATH/.secret`). Changing the password logs everyone out.
+After 5 wrong passwords from one IP, logins from that IP are blocked for
+15 minutes.
 Leave `ADMIN_PASSWORD` empty to allow anyone to download.
+
+With a password set, the page's player uses signed links that expire after
+12 hours, so the bare `/vods/<file>.mp4` URL can't be shared or scraped as a
+permanent download. This is a deterrent, not DRM: anyone who can watch a
+video in their browser can still save it with the browser's developer tools.
 
 Generate a strong password:
 ```bash
@@ -433,25 +516,8 @@ THUMB_OFFSET=60    # grab the frame at this many seconds into the VOD
 ```
 
 Thumbnails are stored alongside the VOD file (`.jpg` with the same name) and
-are removed automatically when the VOD is deleted.
-
-### Email notifications
-
-When a VOD finishes recording, the recorder sends an HTML email with a link to
-the VOD page so you know it's ready to download for YouTube.
-
-```env
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587           # 465 for implicit TLS (e.g. some older servers)
-SMTP_USER=you@gmail.com
-SMTP_PASS=your-app-password
-NOTIFY_TO=you@gmail.com
-```
-
-For **Gmail** you need an [App Password](https://myaccount.google.com/apppasswords)
-(requires 2-Step Verification). For other providers, check their SMTP docs.
-
-Leave `SMTP_HOST` empty to disable email notifications entirely.
+are removed automatically when the VOD is deleted. Cloud backup uploads them
+too, so cloud-only VODs keep their thumbnail.
 
 ---
 
@@ -468,6 +534,55 @@ Run these in `/opt/owncast-vods`:
 | Apply `.env` changes | `docker compose up -d` |
 | Update to latest | `git pull && docker compose up -d --build` |
 | Disk usage | `du -sh vods && df -h .` |
+
+### Without Docker
+
+The recorder only needs Python 3.9+ and ffmpeg, so it can run from a normal
+user account. `run.sh` loads `.env`, saves VODs to `VOD_PATH`, uses
+`/usr/bin/ffmpeg` when it exists, and starts the cloud backup too when
+`COMPOSE_PROFILES=backup` is set.
+
+| Task | Command |
+|---|---|
+| Start (does nothing if already running) | `./run.sh` |
+| Restart, e.g. after `git pull` or `.env` changes | `./run.sh restart` |
+| Stop | `./run.sh stop` |
+| What's running | `./run.sh status` |
+| Logs | `tail -f recorder.log` / `tail -f backup.log` |
+
+A restart ends the VOD being recorded, so do it while offline. To keep it
+running after reboots and crashes, add to `crontab -e`:
+
+```
+@reboot     $HOME/owncast-vods/run.sh >/dev/null 2>&1
+*/5 * * * * $HOME/owncast-vods/run.sh >/dev/null 2>&1
+```
+
+For cloud backup, install rclone into `~/bin` (no root needed):
+
+```bash
+mkdir -p ~/bin /tmp/rclone-dl && cd /tmp/rclone-dl
+curl -LO https://downloads.rclone.org/rclone-current-linux-amd64.zip
+python3 -m zipfile -e rclone-current-linux-amd64.zip . && cp rclone-*-linux-amd64/rclone ~/bin/
+chmod +x ~/bin/rclone && cd ~ && rm -rf /tmp/rclone-dl && ~/bin/rclone version | head -1
+```
+
+Then follow section 7, running rclone from the repo folder as
+`~/bin/rclone --config rclone/rclone.conf ...` in place of
+`docker run ... rclone/rclone ...`. The `--config` part matters: `run.sh`
+reads the remote from `rclone/rclone.conf`, not rclone's usual
+`~/.config/rclone/`. For Dropbox, instead of answering the `config` prompts you
+can create the remote in one line with the token from section 7a:
+
+```bash
+cd ~/owncast-vods && mkdir -p rclone
+~/bin/rclone --config rclone/rclone.conf config create dropbox dropbox token '<paste the {"access_token":...} line>'
+~/bin/rclone --config rclone/rclone.conf lsd dropbox:
+```
+
+Then set the 7b and 7c lines in `.env` and run `./run.sh restart`.
+`./run.sh status` should show `cloud backup: running`, and `backup.log` shows
+each upload.
 
 ---
 
