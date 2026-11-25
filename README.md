@@ -406,9 +406,10 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `BACKUP_INTERVAL_MIN` | `15` | Minutes between upload runs |
 | `BACKUP_RETENTION_DAYS` | `0` | Delete from the remote after N days (`0` = never) |
 
-**Endpoints:** `/vods` (page), `/vods/<file>.mp4` (video stream; needs the
-page's signed link when `ADMIN_PASSWORD` is set),
-`/vods/download/<file>.mp4` (download, gated by `ADMIN_PASSWORD`),
+**Endpoints:** `/vods` (public page), `/vods/<file>.mp4` (video stream, always public),
+`/vods/admin` (admin dashboard — login wall, manage/delete VODs),
+`/vods/admin/logout`, `/vods/admin/delete` (POST),
+`/vods/download/<file>.mp4` (admin only),
 `/vods/login` (POST, sets session cookie), `/vods/api/list` (JSON),
 `/vods/api/comments?vod=<file>.mp4` (comments, JSON; POST to add,
 POST `/vods/api/comments/delete` to remove), `/vods/api/like` (POST

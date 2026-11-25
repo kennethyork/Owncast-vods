@@ -122,7 +122,7 @@ def _is_admin(handler) -> bool:
 
 
 def _download_allowed(handler) -> bool:
-    """True if the request has a valid admin cookie. Used only for /admin routes."""
+    """True if the request has a valid admin cookie. Used only for /vods/admin routes."""
     return _is_admin(handler)
 
 
@@ -1409,7 +1409,7 @@ def render_page(authed: bool = True, embed: bool = False, host: str = "", viewer
     logo = html.escape(LIVE_URL.rstrip("/") + "/logo", quote=True)
     titles = load_titles()
     vods = merged_vods()
-    gated = False  # /vods is always public; downloads and auth live at /admin
+    gated = False  # /vods is always public; downloads and auth live at /vods/admin
     week_ago = time.strftime("%Y-%m-%d", time.localtime(time.time() - 6 * 86400))
 
     data, rows, day = [], [], None
@@ -1480,7 +1480,7 @@ def render_page(authed: bool = True, embed: bool = False, host: str = "", viewer
         header = (f'<header><a href="{live}"><img class="logo" src="{logo}" alt="" onerror="this.remove()"></a>'
                   f'<div class="brand"><b>{html.escape(site)}</b><span>{html.escape(host)}</span></div>{status}'
                   f'<nav><a href="{live}">Live</a><a class="on" href="/vods">VODs</a>{links}'
-                  f'{"<a href=/admin>Admin</a>" if ADMIN_PASSWORD else ""}</nav></header>')
+                  f'{"<a href=/vods/admin>Admin</a>" if ADMIN_PASSWORD else ""}</nav></header>')
         parts = [html.escape(site), f'<a href="{live}">Watch live</a>'] + extra
         footer = "<footer>" + " · ".join(parts) + "</footer>"
 
@@ -1530,7 +1530,7 @@ def render_page(authed: bool = True, embed: bool = False, host: str = "", viewer
     ).encode()
 
 
-# ── Admin login page (/admin — shown when not authenticated) ─────────────────
+# ── Admin login page (/vods/admin — shown when not authenticated) ────────────
 
 _ADMIN_LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1559,7 +1559,7 @@ function doLogin(){
   fetch('/vods/login',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({password:pw})})
   .then(function(r){return r.json();}).then(function(d){
-    if(d.ok){location.href='/admin';}
+    if(d.ok){location.href='/vods/admin';}
     else{document.getElementById('err').textContent='Wrong password.';}
   });
 }
@@ -1627,7 +1627,7 @@ def render_admin():
             f'<h1>Admin – {t} '
             f'<span style="font-size:.8rem;font-weight:400">'
             f'<a href="/vods">← public page</a>&nbsp;&nbsp;'
-            f'<a href="/admin/logout" style="color:#888">log out</a>'
+            f'<a href="/vods/admin/logout" style="color:#888">log out</a>'
             f'</span></h1>'
             f'<video id="p" controls playsinline></video>'
             f'{body}'
@@ -1635,7 +1635,7 @@ def render_admin():
             f'function delVod(name,btn){{'
             f'if(!confirm("Delete "+name+"?"))return;'
             f'btn.disabled=true;btn.textContent="Deleting…";'
-            f'fetch("/admin/delete",{{method:"POST",'
+            f'fetch("/vods/admin/delete",{{method:"POST",'
             f'headers:{{"Content-Type":"application/json"}},'
             f'body:JSON.stringify({{name:name}})}}).then(function(r){{return r.json();}}).then(function(d){{'
             f'if(d.ok){{var row=document.getElementById("row-"+name);if(row)row.remove();}}'
@@ -1704,14 +1704,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "bad_query"})
             return self._json(200, {"results": search_vods(q)}, extra={"Cache-Control": "no-store"})
         # ---- admin pages ----
-        if path in ("/admin", "/admin/"):
+        if path in ("/vods/admin", "/vods/admin/"):
             if not _download_allowed(self):
                 return self._send(200, _ADMIN_LOGIN_PAGE.encode(), "text/html; charset=utf-8")
             return self._send(200, render_admin(), "text/html; charset=utf-8",
                               extra={"Cache-Control": "no-store"})
-        if path == "/admin/logout":
+        if path == "/vods/admin/logout":
             self.send_response(302)
-            self.send_header("Location", "/admin")
+            self.send_header("Location", "/vods/admin")
             self.send_header("Set-Cookie",
                 "vod_admin=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
             self.send_header("Content-Length", "0")
@@ -1738,7 +1738,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         # ---- Admin delete ----
-        if u.path == "/admin/delete":
+        if u.path == "/vods/admin/delete":
             if not _download_allowed(self):
                 return self._send(403, json.dumps({"ok": False, "error": "login required"}).encode(),
                                   "application/json")
