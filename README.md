@@ -387,7 +387,7 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `RETENTION_DAYS` | `14` | Delete local VODs after N days (`0` = never) |
 | `MIN_FREE_GB` | `5` | Delete the oldest VODs when free space drops below this |
 | `TITLE` | `Stream VODs` | Page name if Owncast's name can't be read |
-| `LIVE_URL` | `/` | Your stream page (default for `NOTIFY_URL`); the logo comes from `LIVE_URL/logo` |
+| `LIVE_URL` | `/` | Your stream page; the logo comes from `LIVE_URL/logo` |
 | `NAV_LINKS` | – | Extra header links, e.g. `Games\|https://games.example.com` |
 | `PORT` | `8090` | VOD page port |
 | `BIND` | `127.0.0.1` | `0.0.0.0` to listen on all interfaces |
@@ -397,18 +397,9 @@ All in `.env`. After changing anything, run `docker compose up -d`.
 | `CLOUD_PORT` | `8091` | WebDAV port inside the backup container |
 | `CLOUD_URL` | – | `http://127.0.0.1:8091` enables cloud playback on /vods |
 | `COMMENTS` | `1` | `0` turns off VOD comments |
+| `LIKES` | `1` | `0` turns off the like button |
 | `THUMB_ENABLED` | `1` | `0` disables thumbnail generation |
 | `THUMB_OFFSET` | `60` | Seconds into the VOD to grab the thumbnail frame |
-| `SMTP_HOST` | – | SMTP server for email notifications (empty = off) |
-| `SMTP_PORT` | `587` | `465` for implicit TLS; `587` for STARTTLS |
-| `SMTP_USER` | – | SMTP login username |
-| `SMTP_PASS` | – | SMTP password / app password |
-| `SMTP_FROM` | `SMTP_USER` | Sender address (defaults to `SMTP_USER`) |
-| `NOTIFY_TO` | – | Comma-separated recipient addresses |
-| `NOTIFY_URL` | `LIVE_URL` | Full site URL used for links in notifications |
-| `DISCORD_WEBHOOK` | – | Discord webhook URL; posts each finished VOD (empty = off) |
-| `NTFY_URL` | – | ntfy topic URL for phone push, e.g. `https://ntfy.sh/my-topic` (empty = off) |
-| `NTFY_TOKEN` | – | Access token for a protected ntfy topic |
 | `BACKUP_REMOTE` | `dropbox` | rclone remote name |
 | `BACKUP_FOLDER` | `Owncast VODs` | Folder (or bucket/folder) on the remote |
 | `BACKUP_INTERVAL_MIN` | `15` | Minutes between upload runs |
@@ -419,7 +410,8 @@ page's signed link when `ADMIN_PASSWORD` is set),
 `/vods/download/<file>.mp4` (download, gated by `ADMIN_PASSWORD`),
 `/vods/login` (POST, sets session cookie), `/vods/api/list` (JSON),
 `/vods/api/comments?vod=<file>.mp4` (comments, JSON; POST to add,
-POST `/vods/api/comments/delete` to remove), `/vods/webhook` (Owncast webhook).
+POST `/vods/api/comments/delete` to remove), `/vods/api/like` (POST
+`{"vod", "like": true|false}`), `/vods/webhook` (Owncast webhook).
 
 ### Comments
 
@@ -445,6 +437,16 @@ won't see the chat identity.
 - Stored next to each VOD as `vod_*.comments.json`, and deleted with the VOD
   unless cloud playback (`CLOUD_URL`) is on, in which case they stay for the
   cloud copy.
+
+### Likes
+
+Each VOD has a **♥ Like** button next to Share, and every card in the grid
+shows its like count. No login is needed: the page gives each browser a random
+`vod_viewer` cookie, and that browser can like a VOD once (click again to
+unlike). To stop one person inflating a count by clearing cookies, at most 5
+likes per VOD are accepted from the same IP address. Likes are stored as
+`vod_*.likes.json` next to each VOD (hashed, no IPs in plain text) and deleted
+with the VOD unless cloud playback is on. `LIKES=0` in `.env` turns them off.
 
 ### Chat replay
 
@@ -501,48 +503,6 @@ THUMB_OFFSET=60    # grab the frame at this many seconds into the VOD
 Thumbnails are stored alongside the VOD file (`.jpg` with the same name) and
 are removed automatically when the VOD is deleted. Cloud backup uploads them
 too, so cloud-only VODs keep their thumbnail.
-
-### Email notifications
-
-When a VOD finishes recording, the recorder sends an HTML email with a link to
-the VOD page so you know it's ready to download for YouTube.
-
-```env
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587           # 465 for implicit TLS (e.g. some older servers)
-SMTP_USER=you@gmail.com
-SMTP_PASS=your-app-password
-NOTIFY_TO=you@gmail.com
-NOTIFY_URL=https://stream.example.com   # full URL; the email links to /vods on it
-```
-
-Each VOD is emailed once. The list of announced VODs is kept in
-`VOD_PATH/.notified.json`, so restarts don't re-send old ones (on the very
-first start, VODs already on disk are not emailed).
-
-For **Gmail** you need an [App Password](https://myaccount.google.com/apppasswords)
-(requires 2-Step Verification). For other providers, check their SMTP docs.
-
-Leave `SMTP_HOST` empty to disable email notifications entirely.
-
-### Discord and phone (ntfy) notifications
-
-No email account needed. Set either or both; each finished VOD is announced
-once (same `.notified.json` list as email) with its title, date, length,
-thumbnail and a link that opens that VOD directly.
-
-```env
-NOTIFY_URL=https://stream.example.com            # full URL, used for the links
-DISCORD_WEBHOOK=https://discord.com/api/webhooks/...   # channel → Integrations → Webhooks
-NTFY_URL=https://ntfy.sh/my-vods-k3x9q2          # topic you subscribed to in the ntfy app
-```
-
-- **Discord:** in your server, open a channel's settings → Integrations →
-  Webhooks → New Webhook → Copy Webhook URL.
-- **ntfy:** install the free ntfy app (Android/iOS), tap +, and subscribe to a
-  topic on `ntfy.sh`. Topics are public to anyone who knows the name, so pick
-  something hard to guess. For a protected or self-hosted topic, also set
-  `NTFY_TOKEN`.
 
 ---
 

@@ -7,8 +7,6 @@ a small VOD browser page you can link from Owncast as an External Action.
 Only needs Python 3.9+ (stdlib) and ffmpeg.
 """
 import base64
-import email.mime.multipart
-import email.mime.text
 import hashlib
 import hmac
 import html
@@ -18,7 +16,6 @@ import re
 import secrets
 import shutil
 import signal
-import smtplib
 import socket
 import ssl
 import subprocess
@@ -47,7 +44,7 @@ POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 PORT = int(os.environ.get("PORT", "8090"))
 BIND = os.environ.get("BIND", "0.0.0.0")
 TITLE = os.environ.get("TITLE", "Stream VODs")
-LIVE_URL = os.environ.get("LIVE_URL", "/")  # stream page; default for NOTIFY_URL
+LIVE_URL = os.environ.get("LIVE_URL", "/")  # stream page
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")  # optional ?token=...
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # download gate; empty = open
@@ -56,6 +53,8 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # download gate; empty = 
 CLOUD_URL = os.environ.get("CLOUD_URL", "").rstrip("/")  # e.g. http://127.0.0.1:8091
 # Comments under VODs, signed with the viewer's Owncast chat name.
 COMMENTS = os.environ.get("COMMENTS", "1") not in ("0", "false", "no", "")
+# Like button on each VOD (one like per browser, no login needed).
+LIKES = os.environ.get("LIKES", "1") not in ("0", "false", "no", "")
 # Save live chat (Owncast CHAT webhook) next to each VOD and replay it in sync.
 CHAT_REPLAY = os.environ.get("CHAT_REPLAY", "1") not in ("0", "false", "no", "")
 # Extra header links, "Label|URL" pairs separated by commas,
@@ -66,20 +65,6 @@ NAV_LINKS = [tuple(p.split("|", 1)) for p in os.environ.get("NAV_LINKS", "").spl
 # Set to "" to disable thumbnail generation.
 THUMB_ENABLED = os.environ.get("THUMB_ENABLED", "1") not in ("0", "false", "no", "")
 THUMB_OFFSET = int(os.environ.get("THUMB_OFFSET", "60"))  # seconds into VOD to grab
-
-# ---- Email notifications ----
-SMTP_HOST = os.environ.get("SMTP_HOST", "")          # e.g. smtp.gmail.com
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASS = os.environ.get("SMTP_PASS", "")
-SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)   # defaults to SMTP_USER
-NOTIFY_TO = os.environ.get("NOTIFY_TO", "")          # comma-separated recipients
-NOTIFY_URL = os.environ.get("NOTIFY_URL", LIVE_URL)  # link in the email body
-
-# ---- Push notifications (no email account needed) ----
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")  # channel → Integrations → Webhooks
-NTFY_URL = os.environ.get("NTFY_URL", "").rstrip("/")    # e.g. https://ntfy.sh/my-secret-topic
-NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "")            # only for protected ntfy topics
 
 FILE_RE = re.compile(r"^vod_(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})\.mp4$")
 
@@ -376,6 +361,59 @@ def save_comments(vod_name: str, items: list):
     tmp.replace(path)
 
 
+# ------------------------------------------------------------- VOD likes ----
+# Anonymous: each browser gets a random vod_viewer cookie and can like a VOD
+# once. Stored as {sha256(viewer): sha256(ip)} so a handful of IPs can't
+# inflate a count by clearing cookies over and over.
+LIKES_PER_IP = 5  # per VOD; leaves room for a household behind one IP
+VIEWER_RE = re.compile(r"^[0-9a-f]{32}$")
+_like_lock = threading.Lock()
+
+
+def likes_path(vod_name: str) -> Path:
+    return VOD_DIR / (vod_name[:-4] + ".likes.json")  # vod_*.mp4 → vod_*.likes.json
+
+
+def load_likes(vod_name: str) -> dict:
+    try:
+        items = json.loads(likes_path(vod_name).read_text())
+        return items if isinstance(items, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        log("could not read likes for", vod_name, e)
+        return {}
+
+
+def set_like(vod_name: str, viewer: str, ip: str, like: bool) -> dict:
+    """Like or unlike; returns {"count", "liked"}. Raises CommentError on refusal."""
+    vh = hashlib.sha256(viewer.encode()).hexdigest()[:24]
+    ih = hashlib.sha256(_SECRET + ip.encode()).hexdigest()[:24]
+    with _like_lock:
+        items = load_likes(vod_name)
+        if like and vh not in items:
+            if sum(1 for v in items.values() if v == ih) >= LIKES_PER_IP:
+                raise CommentError(429, "too_many")
+            items[vh] = ih
+        elif not like:
+            items.pop(vh, None)
+        else:
+            return {"count": len(items), "liked": True}
+        path = likes_path(vod_name)
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(items))
+            tmp.replace(path)
+        except OSError as e:
+            log("could not save likes for", vod_name, e)
+            raise CommentError(500, "save_failed")
+        return {"count": len(items), "liked": vh in items}
+
+
+def viewer_liked(vod_name: str, viewer: str) -> bool:
+    return bool(viewer) and hashlib.sha256(viewer.encode()).hexdigest()[:24] in load_likes(vod_name)
+
+
 # ----------------------------------------------------------- chat replay ----
 # One JSON object per line: {"id", "t" (seconds into the VOD), "name", "color",
 # "mod", "text"} plus "h": 1 while a moderator has the message hidden.
@@ -568,24 +606,18 @@ class Recorder:
             self.proc = None
 
     def loop(self):
-        # VODs already announced by email, saved to disk so a restart doesn't
-        # re-send one email per VOD. First run: everything on disk counts as seen.
-        seen = load_seen()
-        if seen is None:
-            seen = {v["name"] for v in list_vods()}
-            save_seen(seen)
         thumb_tried: set = set()
         while True:
             # One bad poll must not kill the thread: the web page would keep
             # working while nothing ever records again.
             try:
-                self.step(seen, thumb_tried)
+                self.step(thumb_tried)
             except Exception:
                 log("recorder loop error:\n" + traceback.format_exc())
             self.wake.wait(POLL_SECONDS)
             self.wake.clear()
 
-    def step(self, seen, thumb_tried):
+    def step(self, thumb_tried):
         online = self.online = self.stream_online()
         if self.proc is not None and self.proc.poll() is not None:
             log("ffmpeg exited with code", self.proc.returncode)
@@ -595,10 +627,7 @@ class Recorder:
         elif not online and self.running:
             self.stop()
         cleanup()
-        # Detect newly finished VODs (not currently recording).
-        vods = list_vods()
-        changed = False
-        for v in vods:
+        for v in list_vods():
             name = v["name"]
             if v.get("recording"):
                 # Remember the stream title the VOD started with.
@@ -608,42 +637,9 @@ class Recorder:
             if not v["thumb"] and name not in thumb_tried:
                 thumb_tried.add(name)
                 make_thumb_bg(name)
-            if name not in seen:
-                seen.add(name)
-                changed = True
-                notify_bg(v)
-        # Forget deleted VODs so the file doesn't grow forever.
-        on_disk = {v["name"] for v in vods}
-        if changed or not seen <= on_disk:
-            seen &= on_disk
-            save_seen(seen)
 
 
 rec = Recorder()
-
-SEEN_FILE = VOD_DIR / ".notified.json"
-
-
-def load_seen():
-    """Set of VOD names already notified, or None if never saved."""
-    try:
-        return set(json.loads(SEEN_FILE.read_text()))
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError) as e:
-        log("could not read", SEEN_FILE.name, "- treating all VODs as seen:", e)
-        return None
-
-
-def save_seen(seen: set):
-    tmp = SEEN_FILE.with_suffix(".tmp")
-    try:
-        VOD_DIR.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(sorted(seen)))
-        tmp.replace(SEEN_FILE)
-    except OSError as e:
-        log("could not save", SEEN_FILE.name, e)
-
 
 # Stream title per VOD, in one file so it outlives the local copy (cloud VODs).
 TITLES_FILE = VOD_DIR / ".titles.json"
@@ -722,7 +718,8 @@ def _delete(v, why):
         log("delete failed", v["name"], e)
     # Remove the matching thumbnail too. Comments and chat stay while the VOD
     # can still be watched from the cloud copy.
-    extras = [thumb_path(v["name"])] + ([] if CLOUD_URL else [comments_path(v["name"]), chat_path(v["name"])])
+    extras = [thumb_path(v["name"])] + ([] if CLOUD_URL else [
+        comments_path(v["name"]), chat_path(v["name"]), likes_path(v["name"])])
     _chat_counts.pop(v["name"], None)
     for p in extras:
         if p.exists():
@@ -779,135 +776,6 @@ def make_thumb(vod_name: str):
 def make_thumb_bg(vod_name: str):
     """Kick off thumbnail generation in a daemon thread."""
     threading.Thread(target=make_thumb, args=(vod_name,), daemon=True).start()
-
-
-# ------------------------------------------------------- notifications ------
-def send_email(vod: dict):
-    """Send a notification email when a VOD finishes. No-op if SMTP not configured."""
-    if not (SMTP_HOST and NOTIFY_TO and SMTP_USER):
-        return
-    recipients = [r.strip() for r in NOTIFY_TO.split(",") if r.strip()]
-    if not recipients:
-        return
-    name = vod["name"]
-    date = vod["date"]
-    start = vod["start"]
-    size = human(vod["size"])
-    vod_url = NOTIFY_URL.rstrip("/") + f"/vods"
-
-    subject = f"[{TITLE}] New VOD ready – {date} {start}"
-    body_text = (
-        f"A new VOD is ready on {TITLE}.\n\n"
-        f"  Date:  {date}\n"
-        f"  Start: {start}\n"
-        f"  Size:  {size}\n"
-        f"  File:  {name}\n\n"
-        f"Watch or download at: {vod_url}\n"
-    )
-    body_html = f"""<html><body style="font-family:sans-serif;color:#222">
-<h2 style="color:#333">New VOD ready on {html.escape(TITLE)}</h2>
-<table style="border-collapse:collapse">
-  <tr><td style="padding:4px 12px 4px 0;color:#666">Date</td><td><b>{html.escape(date)}</b></td></tr>
-  <tr><td style="padding:4px 12px 4px 0;color:#666">Start</td><td><b>{html.escape(start)}</b></td></tr>
-  <tr><td style="padding:4px 12px 4px 0;color:#666">Size</td><td>{html.escape(size)}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;color:#666">File</td><td><code>{html.escape(name)}</code></td></tr>
-</table>
-<p style="margin-top:20px">
-  <a href="{html.escape(vod_url, quote=True)}" style="background:#333;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none">
-    Watch / Download →
-  </a>
-</p>
-</body></html>"""
-
-    msg = email.mime.multipart.MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = SMTP_FROM or SMTP_USER
-    msg["To"] = ", ".join(recipients)
-    msg.attach(email.mime.text.MIMEText(body_text, "plain"))
-    msg.attach(email.mime.text.MIMEText(body_html, "html"))
-
-    try:
-        ctx = ssl.create_default_context()
-        if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=15) as s:
-                s.login(SMTP_USER, SMTP_PASS)
-                s.sendmail(msg["From"], recipients, msg.as_string())
-        else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-                s.ehlo()
-                s.starttls(context=ctx)
-                s.login(SMTP_USER, SMTP_PASS)
-                s.sendmail(msg["From"], recipients, msg.as_string())
-        log("email sent to", ", ".join(recipients), "for", name)
-    except Exception as e:
-        log("email failed:", e)
-
-
-UA = "owncast-vods (https://github.com/kennethyork/Owncast-vods)"  # Discord rejects urllib's default
-
-
-def _post_json(url: str, body: dict, headers: dict = None):
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={
-        "Content-Type": "application/json", "User-Agent": UA, **(headers or {})})
-    urllib.request.urlopen(req, timeout=15).close()
-
-
-def send_push(vod: dict):
-    """Post a finished VOD to Discord and/or ntfy. No-op if neither is set."""
-    if not (DISCORD_WEBHOOK or NTFY_URL):
-        return
-    name = vod["name"]
-    # The thumbnail is made in parallel when the VOD finishes; give it a moment.
-    for _ in range(30):
-        if not THUMB_ENABLED or thumb_path(name).exists():
-            break
-        time.sleep(3)
-    site = owncast_info().get("name") or TITLE
-    title = load_titles().get(name, "")
-    clock = _clock(vod["start"])
-    if _norm(title) in ("", _norm(site)):
-        title = f"Stream · {clock}"
-    t = time.strptime(vod["date"], "%Y-%m-%d")
-    when = f'{time.strftime("%A, %B", t)} {t.tm_mday} · {clock}'
-    secs = _duration(vod)
-    if secs:
-        when += f" · {_length(secs)}"
-    base = NOTIFY_URL.rstrip("/")
-    link = f"{base}/vods?v={urllib.parse.quote(name)}"
-    thumb = f"{base}/vods/thumb/{name[:-4]}.jpg" if thumb_path(name).exists() else ""
-
-    if DISCORD_WEBHOOK:
-        embed = {"title": f"New VOD: {title}"[:256], "url": link, "description": when, "color": 0xF5B942}
-        if thumb:
-            embed["image"] = {"url": thumb}
-        try:
-            _post_json(DISCORD_WEBHOOK, {"username": site[:80], "embeds": [embed]})
-            log("discord notified for", name)
-        except Exception as e:
-            log("discord notify failed:", e)
-
-    if NTFY_URL:
-        # JSON publishing (POST to the server root) keeps emoji/accents in titles intact.
-        u = urllib.parse.urlsplit(NTFY_URL)
-        msg = {"topic": u.path.rsplit("/", 1)[-1], "title": f"{site}: new VOD",
-               "message": f"{title}\n{when}", "click": link, "tags": ["movie_camera"]}
-        if thumb:
-            msg["attach"] = thumb
-        try:
-            _post_json(f"{u.scheme}://{u.netloc}", msg,
-                       {"Authorization": f"Bearer {NTFY_TOKEN}"} if NTFY_TOKEN else None)
-            log("ntfy notified for", name)
-        except Exception as e:
-            log("ntfy notify failed:", e)
-
-
-def notify(vod: dict):
-    send_email(vod)
-    send_push(vod)
-
-
-def notify_bg(vod: dict):
-    threading.Thread(target=notify, args=(vod,), daemon=True).start()
 
 
 # ---------------------------------------------------------- cloud listing ----
@@ -1033,6 +901,10 @@ button{font:inherit;color:inherit}
 .btn.primary{background:var(--grad);color:#1a1206}
 .btn.ghost{background:var(--panel2);color:var(--text);border-color:var(--line)}
 .btn.ghost:hover{border-color:#ffc85766}
+#like.on{color:#ff7a8a;border-color:#ff7a8a66;background:#ff5a6e14}
+#like em{font-style:normal;color:var(--mute);font-weight:600}
+#like.on em{color:#ff9aa6}
+#like:disabled{opacity:.6;cursor:default}
 .btn:disabled{opacity:.55;cursor:default}
 .chip{display:inline-block;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:700;letter-spacing:.4px;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);color:#fff}
 .chip.gold{background:var(--grad);color:#1a1206}
@@ -1134,7 +1006,8 @@ main{padding:6px 22px 40px;max-width:1500px;margin:0 auto}
 .cb{padding:11px 13px 13px}
 .cb b{display:block;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cb .row{display:flex;justify-content:space-between;gap:8px;color:var(--mute);font-size:13px;margin-top:3px}
-.cb .row .c{color:#c6cde0}
+.cb .row .c{color:#c6cde0;margin-left:8px}
+.cb .row .n{white-space:nowrap}
 .empty{text-align:center;padding:70px 20px;color:var(--mute)}
 .empty b{display:block;color:var(--text);font-size:18px;margin-bottom:6px}
 footer{color:var(--dim);font-size:12px;text-align:center;padding:20px}
@@ -1176,6 +1049,7 @@ var VODS=%%DATA%%,GATED=%%GATED%%;
 %%SIDE_JS%%
 %%CHAT_JS%%
 %%COMMENTS_JS%%
+%%LIKE_JS%%
 </script></body></html>"""
 
 STAGE = """<section class="stage%%SOLO%%" id="stage"><div class="pcol">
@@ -1187,7 +1061,7 @@ STAGE = """<section class="stage%%SOLO%%" id="stage"><div class="pcol">
 </div>%%SIDE%%</section>
 <section class="info"><img class="logo" src="%%LOGO%%" alt="" onerror="this.remove()">
 <div class="txt"><h1 id="vtitle"></h1><div class="meta" id="vmeta"></div>%%TAGS%%</div>
-<div class="acts"><button class="btn ghost" id="share" type="button">⤴ Share</button>
+<div class="acts">%%LIKE_BTN%%<button class="btn ghost" id="share" type="button">⤴ Share</button>
 <button class="btn ghost" id="dl" type="button">%%DL_LABEL%%</button></div></section>"""
 
 PAGE_JS = """
@@ -1219,6 +1093,7 @@ function select(i,play,t,quiet){var v=VODS[i];if(!v)return;
   cards().forEach(function(c){c.classList.toggle('now',+c.dataset.i===i);cardProg(c)});
   if(!quiet){var q=new URLSearchParams(location.search);q.set('v',v.n);q.delete('t');history.replaceState(null,'','?'+q)}
   if(play)P.play().catch(function(){});
+  if(window.showLike)showLike(v);
   if(window.loadComments)loadComments(v.n);
   if(window.loadChat)loadChat(v.n);}
 P.addEventListener('play',function(){$('stage').classList.add('playing')});
@@ -1251,6 +1126,20 @@ document.addEventListener('DOMContentLoaded',function(){var q=new URLSearchParam
   i=VODS.findIndex(function(v){return v.n===q.get('v')});
   if(i<0){i=Math.max(0,VODS.findIndex(function(v){return !v.rec}));t=NaN}
   select(i,false,isNaN(t)?null:t,true);});
+"""
+
+LIKE_BTN = '<button class="btn ghost" id="like" type="button" aria-pressed="false">♡ Like <em id="lkn"></em></button>'
+LIKE_JS = """
+function likeCard(v){var c=document.querySelector('.card[data-i="'+VODS.indexOf(v)+'"] .lk');if(c)c.textContent='\u2665 '+v.lk}
+function showLike(v){var b=$('like');b.classList.toggle('on',!!v.liked);b.setAttribute('aria-pressed',v.liked?'true':'false');
+  b.firstChild.textContent=v.liked?'\u2665 Liked ':'\u2661 Like ';$('lkn').textContent=v.lk||'';b.title=''}
+$('like').onclick=function(){if(!cur)return;var b=this,v=cur,want=!v.liked;b.disabled=true;
+  fetch('/vods/api/like',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({vod:v.n,like:want})}).then(function(r){return r.json().then(function(j){return [r.ok,j]})})
+  .then(function(x){if(x[0]){v.lk=x[1].count;v.liked=x[1].liked;likeCard(v);if(v===cur)showLike(v)}
+    else likeErr(x[1].error==='too_many'?'Too many likes from your network':'Could not save your like')})
+  .catch(function(){likeErr('Could not save your like')}).finally(function(){b.disabled=false})};
+function likeErr(t){var b=$('like');b.title=t;b.firstChild.textContent='\u2715 '+t+' '}
 """
 
 CHAT_TAB = '<button type="button" data-tab="chat">Chat replay<em id="chcount"></em></button>'
@@ -1433,7 +1322,7 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def render_page(authed: bool = False, embed: bool = False, host: str = ""):
+def render_page(authed: bool = False, embed: bool = False, host: str = "", viewer: str = ""):
     """authed=True means the request already has a valid admin cookie."""
     info = owncast_info()
     site = info.get("name") or TITLE
@@ -1466,12 +1355,14 @@ def render_page(authed: bool = False, embed: bool = False, host: str = ""):
             span = clock
         thumb = f"/vods/thumb/{name[:-4]}.jpg" if v.get("thumb") else ""
         play = "" if authed else _play_query(name)
+        likes = len(load_likes(name)) if LIKES else 0
         data.append({
             "n": name, "th": thumb, "title": heading, "dur": secs, "rec": recording, "cloud": cloud,
             "src": (f"/vods/cloud/{name}" if cloud else f"/vods/{name}") + play,
             "dl": f"/vods/cloud/{name}?dl=1" if cloud else f"/vods/download/{name}",
             "when": f"{short} · {clock}",
             "meta": f'{time.strftime("%A, %B", t)} {t.tm_mday} · {span}',
+            "lk": likes, "liked": LIKES and viewer_liked(name, viewer),
         })
 
         if v["date"] != day:
@@ -1483,13 +1374,14 @@ def render_page(authed: bool = False, embed: bool = False, host: str = ""):
                 '<span class="chip other">☁ CLOUD</span>' if cloud else "")
         img = (f'<img src="{thumb}" alt="" loading="lazy">' if thumb else '<div class="ph">▶</div>')
         dur = f'<span class="dur">{_hms(secs)}</span>' if secs else ""
-        count = f'<span class="c">💬 {len(load_comments(name))}</span>' if COMMENTS else ""
+        count = ((f'<span class="c lk">♥ {likes}</span>' if LIKES else "")
+                 + (f'<span class="c">💬 {len(load_comments(name))}</span>' if COMMENTS else ""))
         sub = f"{short} · {clock}" if title else short
         flags = (' data-wk="1"' if v["date"] >= week_ago else "") + (' data-cloud="1"' if cloud else "")
         rows.append(
             f'<a class="card" href="?v={urllib.parse.quote(name)}" data-i="{i}"{flags}>'
             f'<div class="th">{img}{chip}<span class="chip gold np">▶ NOW PLAYING</span>{dur}<span class="prog"></span></div>'
-            f'<div class="cb"><b>{html.escape(heading)}</b><div class="row"><span>{sub}</span>{count}</div></div></a>'
+            f'<div class="cb"><b>{html.escape(heading)}</b><div class="row"><span>{sub}</span><span class="n">{count}</span></div></div></a>'
         )
     if vods:
         rows.append("</div>")
@@ -1505,8 +1397,7 @@ def render_page(authed: bool = False, embed: bool = False, host: str = ""):
                   else '<span class="status"><i></i>Offline</span>')
         header = (f'<header><a href="{live}"><img class="logo" src="{logo}" alt="" onerror="this.remove()"></a>'
                   f'<div class="brand"><b>{html.escape(site)}</b><span>{html.escape(host)}</span></div>{status}'
-                  f'<nav><a href="{live}">Live</a><a class="on" href="/vods">VODs</a>{links}</nav>'
-                  f'<a class="btn ghost" href="{live}" title="Get notified on the live page">🔔 Notify</a></header>')
+                  f'<nav><a href="{live}">Live</a><a class="on" href="/vods">VODs</a>{links}</nav></header>')
         parts = [html.escape(site), f'<a href="{live}">Watch live</a>'] + extra
         footer = "<footer>" + " · ".join(parts) + "</footer>"
 
@@ -1520,7 +1411,7 @@ def render_page(authed: bool = False, embed: bool = False, host: str = ""):
                     + (CHAT_PANE if CHAT_REPLAY else "") + (COMMENTS_PANE if COMMENTS else "")
                     + "</div></aside>")
         stage = _fill(STAGE, SOLO="" if side else " solo", SIDE=side,
-                      LOGO=logo, TAGS=f'<div class="tags">{tags}</div>' if tags else "",
+                      LOGO=logo, LIKE_BTN=LIKE_BTN if LIKES else "", TAGS=f'<div class="tags">{tags}</div>' if tags else "",
                       DL_LABEL="🔒 Download" if gated else "⬇ Download")
 
     n = len(vods)
@@ -1548,6 +1439,7 @@ def render_page(authed: bool = False, embed: bool = False, host: str = ""):
         SIDE_JS=SIDE_JS if (COMMENTS or CHAT_REPLAY) and vods else "",
         CHAT_JS=CHAT_JS if CHAT_REPLAY and vods else "",
         COMMENTS_JS=COMMENTS_JS if COMMENTS and vods else "",
+        LIKE_JS=LIKE_JS if LIKES and vods else "",
     ).encode()
 
 
@@ -1576,8 +1468,13 @@ class Handler(BaseHTTPRequestHandler):
             embed = "embed" in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             # no-store: the page holds expiring playback links
             host = self.headers.get("Host", "").split(":")[0]
-            return self._send(200, render_page(authed, embed, host), "text/html; charset=utf-8",
-                              extra={"Cache-Control": "no-store"})
+            viewer = self._viewer()
+            extra = {"Cache-Control": "no-store"}
+            if LIKES and not viewer:
+                viewer = secrets.token_hex(16)
+                extra["Set-Cookie"] = self._viewer_cookie(viewer)
+            return self._send(200, render_page(authed, embed, host, viewer), "text/html; charset=utf-8",
+                              extra=extra)
         if path in ("/", ""):
             return self._send(302, extra={"Location": "/vods"})
         if path == "/vods/api/list":
@@ -1660,6 +1557,8 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(1)  # slow down guessing even below the limit
                 self._send(401, json.dumps({"ok": False}).encode(), "application/json")
             return
+        if u.path == "/vods/api/like" and LIKES:
+            return self.post_like()
         if u.path in ("/vods/api/comments", "/vods/api/comments/delete") and COMMENTS:
             try:
                 if u.path.endswith("/delete"):
@@ -1711,6 +1610,32 @@ class Handler(BaseHTTPRequestHandler):
                 tok = v.strip().strip('"')
                 break
         return tok if TOKEN_RE.match(tok) else ""
+
+    def _viewer(self) -> str:
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "vod_viewer" and VIEWER_RE.match(v.strip()):
+                return v.strip()
+        return ""
+
+    @staticmethod
+    def _viewer_cookie(viewer: str) -> str:
+        return f"vod_viewer={viewer}; Path=/vods; HttpOnly; SameSite=Lax; Max-Age={5 * 365 * 86400}"
+
+    def post_like(self):
+        body = self._json_body()
+        name = str(body.get("vod", ""))
+        if not vod_exists(name):
+            return self._json(404, {"ok": False, "error": "not_found"})
+        viewer, extra = self._viewer(), None
+        if not viewer:  # cookie blocked or expired since the page loaded
+            viewer = secrets.token_hex(16)
+            extra = {"Set-Cookie": self._viewer_cookie(viewer)}
+        try:
+            res = set_like(name, viewer, _client_ip(self), body.get("like") is not False)
+        except CommentError as e:
+            return self._json(e.code, {"ok": False, "error": e.err}, extra)
+        self._json(200, {"ok": True, **res}, extra)
 
     def post_comment(self):
         body = self._json_body()
@@ -1895,8 +1820,6 @@ def main():
     log(f"owncast-vod: {OWNCAST_URL}, chunks={SEGMENT_SECONDS}s, dir={VOD_DIR}, port={PORT}")
     if WEBHOOK_TOKEN.startswith("change-me") or ADMIN_PASSWORD.startswith("change-me"):
         log("WARNING: WEBHOOK_TOKEN / ADMIN_PASSWORD still use the example value - change them in .env")
-    if (SMTP_HOST or DISCORD_WEBHOOK or NTFY_URL) and not NOTIFY_URL.startswith(("http://", "https://")):
-        log("WARNING: NOTIFY_URL should be a full URL (https://...) or notification links won't work")
     threading.Thread(target=rec.loop, daemon=True).start()
 
     def shutdown(*_):
