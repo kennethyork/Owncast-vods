@@ -122,29 +122,18 @@ def _is_admin(handler) -> bool:
 
 
 def _download_allowed(handler) -> bool:
-    """Return True if the request carries a valid session cookie or no password is set."""
-    return not ADMIN_PASSWORD or _is_admin(handler)
+    """True if the request has a valid admin cookie. Used only for /admin routes."""
+    return _is_admin(handler)
 
 
-def _play_query(name: str) -> str:
-    """Query string that lets the page player stream `name` for a limited time.
-    Empty when there is no password (playback URLs are then plain and permanent)."""
-    if not ADMIN_PASSWORD:
-        return ""
-    exp = int(time.time()) + PLAY_LINK_SECONDS
-    return f"?exp={exp}&sig={_sign(f'play:{name}:{exp}')}"
+def _play_query(name: str) -> str:  # noqa: ARG001
+    """Playback URLs are always open — no signed links needed."""
+    return ""
 
 
-def _play_allowed(handler, name: str) -> bool:
-    """Streaming needs a signed link from the page (or an admin cookie) when a
-    password is set, so the raw /vods/<file>.mp4 URL isn't a permanent download."""
-    if _download_allowed(handler):
-        return True
-    q = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
-    exp, sig = q.get("exp", [""])[0], q.get("sig", [""])[0]
-    if not (exp.isascii() and exp.isdigit()) or int(exp) < time.time():
-        return False
-    return hmac.compare_digest(sig.encode(), _sign(f"play:{name}:{exp}").encode())
+def _play_allowed(handler, name: str) -> bool:  # noqa: ARG001
+    """Streaming is always public; no password required."""
+    return True
 
 
 # ---- Login rate limiting: LOGIN_MAX_FAILS wrong passwords per IP per window ----
@@ -1412,15 +1401,15 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def render_page(authed: bool = False, embed: bool = False, host: str = "", viewer: str = ""):
-    """authed=True means the request already has a valid admin cookie."""
+def render_page(authed: bool = True, embed: bool = False, host: str = "", viewer: str = ""):
+    """Public page — always open; authed kept for compat but gated is always False."""
     info = owncast_info()
     site = info.get("name") or TITLE
     live = html.escape(LIVE_URL, quote=True)
     logo = html.escape(LIVE_URL.rstrip("/") + "/logo", quote=True)
     titles = load_titles()
     vods = merged_vods()
-    gated = ADMIN_PASSWORD != "" and not authed
+    gated = False  # /vods is always public; downloads and auth live at /admin
     week_ago = time.strftime("%Y-%m-%d", time.localtime(time.time() - 6 * 86400))
 
     data, rows, day = [], [], None
@@ -1444,7 +1433,7 @@ def render_page(authed: bool = False, embed: bool = False, host: str = "", viewe
         else:
             span = clock
         thumb = f"/vods/thumb/{name[:-4]}.jpg" if v.get("thumb") else ""
-        play = "" if authed else _play_query(name)
+        play = _play_query(name)  # always "" — playback is public
         likes = len(load_likes(name)) if LIKES else 0
         data.append({
             "n": name, "th": thumb, "title": heading, "dur": secs, "rec": recording, "cloud": cloud,
@@ -1677,18 +1666,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
-        # ---- public VOD page (read-only, no auth) ----
+        # ---- public VOD page (always open — no auth) ----
         if path in ("/vods", "/vods/"):
-            authed = _download_allowed(self)
             embed = "embed" in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            # no-store: the page holds expiring playback links
             host = self.headers.get("Host", "").split(":")[0]
             viewer = self._viewer()
             extra = {"Cache-Control": "no-store"}
             if LIKES and not viewer:
                 viewer = secrets.token_hex(16)
                 extra["Set-Cookie"] = self._viewer_cookie(viewer)
-            return self._send(200, render_page(authed, embed, host, viewer), "text/html; charset=utf-8",
+            return self._send(200, render_page(True, embed, host, viewer), "text/html; charset=utf-8",
                               extra=extra)
         if path in ("/", ""):
             return self._send(302, extra={"Location": "/vods"})
@@ -1730,10 +1717,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        # /vods/download/<name>  — gated download (triggers Content-Disposition)
+        # /vods/download/<name>  — open download (Content-Disposition)
         if path.startswith("/vods/download/"):
-            if not _download_allowed(self):
-                return self._send(403, b"login required")
             name = urllib.parse.unquote(path[len("/vods/download/"):])
             return self.serve_file(name, download=True)
         # /vods/cloud/<name>  — proxy to rclone WebDAV (cloud-only files)
@@ -1741,20 +1726,13 @@ class Handler(BaseHTTPRequestHandler):
             name = urllib.parse.unquote(path[len("/vods/cloud/"):])
             parsed = urllib.parse.urlparse(self.path)
             force_dl = "dl" in urllib.parse.parse_qs(parsed.query)
-            if force_dl and not _download_allowed(self):
-                return self._send(403, b"login required")
-            if not _play_allowed(self, name):
-                return self._send(403, b"link expired - reload the VOD page")
             return self.proxy_cloud(name, download=force_dl)
         # /vods/thumb/<name>.jpg  — VOD thumbnail (public)
         if path.startswith("/vods/thumb/"):
             return self.serve_thumb(urllib.parse.unquote(path[len("/vods/thumb/"):]))
-        # /vods/<name>  — streaming (needs a signed link from the page if a password is set)
+        # /vods/<name>  — streaming (always public)
         if path.startswith("/vods/"):
-            name = urllib.parse.unquote(path[6:])
-            if not _play_allowed(self, name):
-                return self._send(403, b"link expired - reload the VOD page")
-            return self.serve_file(name)
+            return self.serve_file(urllib.parse.unquote(path[6:]))
         self._send(404, b"not found")
 
     def do_POST(self):
