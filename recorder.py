@@ -1196,7 +1196,7 @@ footer a:hover{color:var(--gold)}
 #mbox button{margin-top:12px;width:100%;padding:10px;background:var(--grad);color:#1a1206;border:0;border-radius:8px;font-size:15px;cursor:pointer;font-weight:700}
 #merr{color:#ff8a8c;font-size:13px;margin-top:8px;min-height:1em}
 /* ?embed=1: inside an iframe on the Owncast page, no header or footer */
-.embed{background:transparent}
+.embed{background:var(--bg)}
 .embed .stage{border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .embed .info{margin:0;padding:16px 2px}
 .embed main{padding:0 2px 16px;max-width:none}
@@ -1680,15 +1680,17 @@ def render_page(authed: bool = True, embed: bool = False, host: str = "", viewer
 _ADMIN_LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Admin login</title><style>
-body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;
+html{color-scheme:dark}
+body{font-family:system-ui,sans-serif;background:#0b1020;color:#eef1f8;margin:0;
      display:flex;align-items:center;justify-content:center;min-height:100vh}
-.box{background:#1e1e1e;padding:32px;border-radius:12px;min-width:280px;text-align:center}
+.box{background:#121a2e;border:1px solid #243150;padding:32px;border-radius:14px;min-width:280px;text-align:center}
 h2{margin:0 0 20px;font-size:1.1rem}
-input{width:100%;padding:9px;border:1px solid #444;border-radius:6px;
-      background:#111;color:#eee;font-size:1rem;box-sizing:border-box}
-button{margin-top:14px;width:100%;padding:10px;background:#8ab4f8;color:#000;
-       border:0;border-radius:6px;font-size:1rem;cursor:pointer;font-weight:600}
-.err{color:#f55;font-size:.85rem;margin-top:10px;min-height:1em}
+input{width:100%;padding:9px;border:1px solid #243150;border-radius:8px;
+      background:#0b1020;color:#eef1f8;font-size:1rem;box-sizing:border-box}
+input:focus{outline:0;border-color:#ffc85788}
+button{margin-top:14px;width:100%;padding:10px;background:linear-gradient(135deg,#ffc857,#ff7a59);color:#1a1206;
+       border:0;border-radius:8px;font-size:1rem;cursor:pointer;font-weight:700}
+.err{color:#ff6b6e;font-size:.85rem;margin-top:10px;min-height:1em}
 </style></head><body>
 <div class="box">
 <h2>Admin login</h2>
@@ -1727,25 +1729,25 @@ def render_admin():
         recording = v.get("recording", False)
         thumb_src = f"/vods/thumb/{f[:-4]}.jpg" if has_thumb else ""
         if has_thumb:
-            thumb_html = f'<img style="width:120px;height:68px;object-fit:cover;border-radius:4px;background:#222;flex-shrink:0" src="{thumb_src}" alt="" loading="lazy">'
+            thumb_html = f'<img style="width:120px;height:68px;object-fit:cover;border-radius:4px;background:#18223b;flex-shrink:0" src="{thumb_src}" alt="" loading="lazy">'
         else:
-            thumb_html = '<div style="width:120px;height:68px;border-radius:4px;background:#1a1a1a;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:1.6rem;color:#444">▶</div>'
+            thumb_html = '<div style="width:120px;height:68px;border-radius:4px;background:#18223b;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:1.6rem;color:#5f6b88">▶</div>'
         data_th = f' data-th="{thumb_src}"' if has_thumb else ""
-        live_badge = '<span style="color:#f55;font-weight:600">● recording</span> ' if recording else ""
-        cloud_badge = '<span style="color:#8ab4f8;font-size:.8rem">☁ cloud</span> ' if is_cloud else ""
+        live_badge = '<span style="color:#e5484d;font-weight:600">● recording</span> ' if recording else ""
+        cloud_badge = '<span style="color:#93a0bd;font-size:.8rem">☁ cloud</span> ' if is_cloud else ""
         player_src = f"/vods/cloud/{f}" if is_cloud else f"/vods/{f}"
         dl_href = f"/vods/cloud/{f}?dl=1" if is_cloud else f"/vods/download/{f}"
-        dl_btn = (f'<a style="padding:5px 11px;border-radius:5px;background:#8ab4f8;color:#000;'
+        dl_btn = (f'<a style="padding:5px 11px;border-radius:5px;background:linear-gradient(135deg,#ffc857,#ff7a59);color:#1a1206;'
                   f'text-decoration:none;font-size:.85rem;font-weight:600" '
                   f'href="{dl_href}" download>⬇ Download</a>')
         if recording or is_cloud:
             del_btn = ""
         else:
-            del_btn = (f'<button style="padding:5px 11px;border-radius:5px;background:#c0392b;'
+            del_btn = (f'<button style="padding:5px 11px;border-radius:5px;background:#e5484d;'
                        f'color:#fff;border:0;cursor:pointer;font-size:.85rem;font-weight:600" '
                        f'onclick="delVod(\'{f}\',this)">🗑 Delete</button>')
         rows.append(
-            f'<div style="display:flex;align-items:center;gap:12px;padding:8px;border-radius:6px;cursor:pointer" '
+            f'<div style="display:flex;align-items:center;gap:12px;padding:8px;border-radius:10px;cursor:pointer;border:1px solid #243150;background:#121a2e;margin-bottom:8px" '
             f'data-f="{player_src}"{data_th} id="row-{f}" '
             f'onclick="if(event.target.tagName===\'A\'||event.target.closest(\'button\')||event.target.closest(\'a\'))return;'
             f'var p=document.getElementById(\'p\'),th=this.dataset.th||\'\';'
@@ -1754,25 +1756,25 @@ def render_admin():
             f'{thumb_html}'
             f'<div style="flex:1;min-width:0">'
             f'<div style="font-size:.95rem">▶ {v["date"]} {v["start"]} {live_badge}{cloud_badge}</div>'
-            f'<div style="color:#888;font-size:.85rem">{human(v["size"])}</div>'
+            f'<div style="color:#93a0bd;font-size:.85rem">{human(v["size"])}</div>'
             f'</div>'
             f'<div style="margin-left:auto;white-space:nowrap;display:flex;gap:8px;align-items:center">'
             f'{dl_btn}{del_btn}</div>'
             f'</div>'
         )
-    body = "\n".join(rows) if rows else "<p style='color:#888'>No VODs yet.</p>"
+    body = "\n".join(rows) if rows else "<p style='color:#93a0bd'>No VODs yet.</p>"
     t = html.escape(TITLE)
     return (f'<!doctype html><html><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>Admin – {t}</title><style>'
-            f'body{{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px;max-width:960px;margin:auto}}'
-            f'h1{{font-size:1.3rem}} a{{color:#8ab4f8}}'
+            f'body{{font-family:system-ui,sans-serif;background:#0b1020;color:#eef1f8;margin:0;padding:16px;max-width:960px;margin:auto}}'
+            f'h1{{font-size:1.3rem}} a{{color:#ffc857}} html{{color-scheme:dark}}'
             f'video{{width:100%;background:#000;border-radius:8px;display:none;margin-bottom:12px}}'
             f'</style></head><body>'
             f'<h1>Admin – {t} '
             f'<span style="font-size:.8rem;font-weight:400">'
             f'<a href="/vods">← public page</a>&nbsp;&nbsp;'
-            f'<a href="/vods/admin/logout" style="color:#888">log out</a>'
+            f'<a href="/vods/admin/logout" style="color:#93a0bd">log out</a>'
             f'</span></h1>'
             f'<video id="p" controls playsinline></video>'
             f'{body}'
