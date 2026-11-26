@@ -1009,12 +1009,31 @@ def owncast_info() -> dict:
         try:
             with urllib.request.urlopen(OWNCAST_URL + "/api/config", timeout=3) as r:
                 d = json.load(r)
+            css = str(d.get("customStyles") or "")
+            m = re.search(r"--[\w-]*banner[\w-]*\s*:\s*url\(\s*data:(image/[\w+.-]+);base64,([A-Za-z0-9+/=]+)\s*\)", css)
             _oc_info["d"] = {"name": str(d.get("name") or ""),
-                             "tags": [str(t) for t in (d.get("tags") or [])][:8]}
+                             "summary": str(d.get("summary") or ""),
+                             "tags": [str(t) for t in (d.get("tags") or [])][:8],
+                             "banner": (m.group(1), base64.b64decode(m.group(2))) if m else None,
+                             "fonts": _owncast_fonts()}
         except Exception as e:
             log("owncast config failed:", e)
         _oc_info["t"] = time.time()
     return _oc_info["d"]
+
+
+def _owncast_fonts() -> str:
+    """Owncast's own @font-face rules (Inter, Poppins; Latin only), so /vods uses the
+    same type as the live page. Read from its page because the file names are hashed."""
+    try:
+        with urllib.request.urlopen(OWNCAST_URL + "/", timeout=3) as r:
+            page = r.read(2_000_000).decode("utf-8", "replace")
+    except Exception as e:
+        log("owncast fonts failed:", e)
+        return ""
+    rules = re.findall(r"@font-face\{[^}]*\}", page)
+    return "".join(r for r in rules if re.search(r"font-family:\s*['\"]?(Inter|Poppins)\b", r)
+                   and "-latin-" in r and "-latin-ext-" not in r and "<" not in r)
 
 
 def _fill(tpl: str, **kw) -> str:
@@ -1025,11 +1044,16 @@ def _fill(tpl: str, **kw) -> str:
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>%%TITLE%%</title><style>
+%%FONTS%%
 :root{--bg:#0b1020;--panel:#121a2e;--panel2:#18223b;--line:#243150;--text:#eef1f8;--mute:#93a0bd;--dim:#5f6b88;
-  --gold:#ffc857;--coral:#ff7a59;--red:#e5383b;--grad:linear-gradient(135deg,var(--gold),var(--coral))}
+  --gold:#ffc857;--coral:#ff7a59;--red:#e5484d;--grad:linear-gradient(135deg,var(--gold),var(--coral));
+  --body:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--display:"Poppins",var(--body)}
 *{box-sizing:border-box}
 html{color-scheme:dark}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 var(--body);-webkit-font-smoothing:antialiased}
+h1,h2,.brand b{font-family:var(--display)}
+::selection{background:#ffc85755}
+* {scrollbar-color:var(--line) transparent}
 a{color:inherit;text-decoration:none}
 button{font:inherit;color:inherit}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;font-weight:700;font-size:14px;border:1px solid transparent;cursor:pointer;white-space:nowrap}
@@ -1046,18 +1070,20 @@ button{font:inherit;color:inherit}
 .chip.rec{background:var(--red);animation:pulse 1.6s infinite}
 @keyframes pulse{50%{opacity:.65}}
 /* header (matches the Owncast live page) */
-header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:14px;padding:10px 22px;background:rgba(11,16,32,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
-header .logo{display:block;width:42px;height:42px;border-radius:10px;box-shadow:0 0 0 2px #ffc85755;object-fit:cover}
-.brand b{display:block;font-size:17px;letter-spacing:.2px;line-height:1.2}
-.brand span{font-size:12px;color:var(--mute)}
-.status{display:inline-flex;align-items:center;gap:6px;margin-left:8px;padding:3px 10px;border-radius:99px;background:#1d2742;color:var(--mute);font-size:12px;font-weight:600}
-.status i{width:8px;height:8px;border-radius:50%;background:#5b6785}
-.status.live{background:#e5383b26;color:#ff8a8c}
-.status.live i{background:var(--red);animation:pulse 1.6s infinite}
-nav{margin-left:auto;display:flex;gap:6px}
-nav a{padding:8px 14px;border-radius:8px;color:var(--mute);font-weight:600;font-size:14px}
-nav a:hover{color:var(--text)}
-nav a.on{color:var(--text);background:var(--panel2)}
+header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:14px;height:70px;padding:0 16px;background:rgba(11,16,32,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+header>a{display:flex;align-items:center;gap:14px;min-width:0}
+header .logo{display:block;width:46px;height:46px;border-radius:10px;box-shadow:0 0 0 2px #ffc85755;object-fit:cover}
+.brand b{display:block;font-size:1.1rem;font-weight:700;letter-spacing:.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.status{flex:none;margin-left:-2px;padding:3px 11px;border-radius:99px;background:#1d2742;color:var(--mute);font-size:12px;font-weight:600;white-space:nowrap}
+.status.live{background:var(--red);color:#fff;letter-spacing:.5px;animation:kgpulse 2s ease-in-out infinite}
+@keyframes kgpulse{50%{box-shadow:0 0 0 5px #e5484d33}}
+/* offline-style stage: the banner on a blurred copy of itself */
+.bstage{position:relative;overflow:hidden;padding:36px 24px;background:#070b16;border-bottom:1px solid var(--line);isolation:isolate}
+.bstage::before{content:"";position:absolute;inset:-40px;z-index:-1;background:url(/vods/banner) center/cover;filter:blur(30px) brightness(.45) saturate(1.2)}
+.bstage img{display:block;width:min(100%,960px);height:auto;margin:0 auto;border-radius:14px;box-shadow:0 18px 50px #000a,0 0 0 1px #ffffff14}
+.about{margin:8px 0 0;color:#c6cde0;font-size:15px;line-height:1.6;max-width:900px}
+.about a{color:var(--gold)}
+.about a:hover{color:var(--coral)}
 /* stage: player + comments column */
 .stage{display:grid;grid-template-columns:minmax(0,1fr) 360px;border-bottom:1px solid var(--line);background:#070b16}
 .stage.solo{grid-template-columns:minmax(0,1fr)}
@@ -1108,18 +1134,19 @@ nav a.on{color:var(--text);background:var(--panel2)}
 #cmsg{font-size:12px;color:var(--mute);margin-top:6px}
 #cmsg:empty{display:none}
 /* title / info row under the player */
-.info{display:flex;gap:18px;align-items:flex-start;padding:18px 22px;border-bottom:1px solid var(--line)}
-.info .logo{width:64px;height:64px;border-radius:14px;object-fit:cover;flex-shrink:0}
+.info{display:flex;gap:26px;align-items:flex-start;margin:0 30px;padding:28px 28px 40px;border-bottom:1px solid var(--line)}
+.info .logo{width:100px;height:100px;border-radius:14px;border:4px solid #efe6d2;object-fit:cover;flex-shrink:0;box-shadow:0 0 0 2px #ffc85744,0 8px 22px #0007}
 .info .txt{min-width:0}
-.info h1{margin:0;font-size:21px;line-height:1.3}
-.meta{color:var(--mute);font-size:14px;margin-top:3px}
-.tags{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}
-.tag{padding:3px 10px;border-radius:99px;background:var(--panel2);border:1px solid var(--line);font-size:12px;color:#c6cde0}
+.info h1{margin:0;font-size:1.45rem;font-weight:700;line-height:1.3}
+.meta{color:#c6cde0;font-size:15px;margin-top:8px}
+.tags{margin-top:16px;display:flex;gap:14px;flex-wrap:wrap}
+.tag{padding:3px 11px;border-radius:99px;background:var(--panel2);border:1px solid var(--line);font-size:12px;font-weight:500;color:#c6cde0}
 .acts{margin-left:auto;display:flex;gap:8px;flex-shrink:0}
 /* VODs grid */
-main{padding:6px 22px 40px;max-width:1500px;margin:0 auto}
-.sec{display:flex;align-items:baseline;gap:12px;margin:26px 0 4px;flex-wrap:wrap}
-.sec h2{margin:0;font-size:18px}
+main{padding:24px 80px 40px;max-width:1600px;margin:0 auto}
+.sec{display:flex;align-items:center;gap:12px;margin:26px 0 4px;flex-wrap:wrap}
+.sec h2{display:flex;align-items:center;gap:10px;margin:0;font-size:1.15rem;font-weight:700}
+.sec h2::before{content:"";width:4px;height:1.1em;border-radius:2px;background:var(--grad)}
 .sec span{color:var(--mute);font-size:13px}
 .filters{margin-left:auto;display:flex;gap:6px}
 .filters button{padding:5px 12px;border-radius:99px;font-size:13px;font-weight:600;color:var(--mute);border:1px solid var(--line);background:none;cursor:pointer}
@@ -1157,7 +1184,7 @@ mark{background:#ffc85740;color:inherit;border-radius:3px;padding:0 1px}
 .cb .row .n{white-space:nowrap}
 .empty{text-align:center;padding:70px 20px;color:var(--mute)}
 .empty b{display:block;color:var(--text);font-size:18px;margin-bottom:6px}
-footer{color:var(--dim);font-size:12px;text-align:center;padding:20px}
+footer{display:flex;justify-content:center;gap:1.2em;flex-wrap:wrap;color:var(--mute);font-size:13px;padding:20px;border-top:1px solid var(--line)}
 footer a{color:var(--mute)}
 footer a:hover{color:var(--gold)}
 /* login modal */
@@ -1171,13 +1198,14 @@ footer a:hover{color:var(--gold)}
 /* ?embed=1: inside an iframe on the Owncast page, no header or footer */
 .embed{background:transparent}
 .embed .stage{border:1px solid var(--line);border-radius:12px;overflow:hidden}
-.embed .info{padding:16px 2px}
+.embed .info{margin:0;padding:16px 2px}
 .embed main{padding:0 2px 16px;max-width:none}
-nav a{white-space:nowrap}
+@media (max-width:1100px){main{padding:20px 22px 40px}.info{margin:0 16px;padding:22px 6px 30px}}
 @media (max-width:980px){.stage{grid-template-columns:minmax(0,1fr)}.side{border-left:0;border-top:1px solid var(--line);height:420px}}
 @media (max-width:1200px){.embed .stage{grid-template-columns:minmax(0,1fr)}.embed .side{border-left:0;border-top:1px solid var(--line);height:420px}}
-@media (max-width:640px){header{padding:8px 12px;gap:10px}.brand span,.status,header .btn,nav a[target]{display:none}nav a{padding:6px 10px}
-  .info{padding:14px 12px;flex-wrap:wrap}.info .logo{display:none}.acts{margin-left:0}
+@media (max-width:640px){header{height:60px;padding:0 12px;gap:10px}header>a{gap:10px}header .logo{width:38px;height:38px}.status .soon{display:none}.tags{gap:8px}
+  .bstage{padding:16px 10px}
+  .info{margin:0;padding:16px 12px 22px;gap:14px;flex-wrap:wrap}.info .logo{width:64px;height:64px;border-width:3px}.info .txt{flex:1 1 200px}.acts{margin-left:0}
   main{padding:4px 12px 30px}.grid{grid-template-columns:1fr 1fr;gap:12px}.cb{padding:9px 10px 10px}.cb b{font-size:13px}
   .filters{margin-left:0;flex-wrap:wrap}.search{width:100%;margin:0 0 4px}.hit .w{display:none}
   .bigplay{width:60px;height:60px;font-size:24px}}
@@ -1501,6 +1529,14 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
+def _linkify(text: str) -> str:
+    """Owncast's summary as one paragraph, with web addresses turned into links."""
+    out = html.escape(" ".join(text.split()))
+    return re.sub(r"\b(https?://[^\s<]+[^\s<.,)]|(?:[a-z0-9-]+\.)+(?:com|net|org|io|gg|tv|dev|app|me|co)\b(?:/[^\s<]*[^\s<.,)])?)",
+                  lambda m: f'<a href="{m.group(1) if m.group(1).startswith("http") else "https://" + m.group(1)}" '
+                            f'target="_blank" rel="noopener">{m.group(1)}</a>', out)
+
+
 def render_page(authed: bool = True, embed: bool = False, host: str = "", viewer: str = ""):
     """Public page — always open; authed kept for compat but gated is always False."""
     info = owncast_info()
@@ -1572,19 +1608,27 @@ def render_page(authed: bool = True, embed: bool = False, host: str = "", viewer
 
     extra = [f'<a href="{html.escape(u.strip(), quote=True)}" target="_blank" rel="noopener">'
              f'{html.escape(label.strip())} ↗</a>' for label, u in NAV_LINKS]
-    links = "".join(extra)
     header = footer = ""
     if not embed:
-        status = ('<span class="status live"><i></i>Live now</span>' if rec.online
-                  else '<span class="status"><i></i>Offline</span>')
-        header = (f'<header><a href="{live}"><img class="logo" src="{logo}" alt="" onerror="this.remove()"></a>'
-                  f'<div class="brand"><b>{html.escape(site)}</b><span>{html.escape(host)}</span></div>{status}'
-                  f'<nav><a href="{live}">Live</a><a class="on" href="/vods">VODs</a>{links}'
-                  f'{"<a href=/vods/admin>Admin</a>" if ADMIN_PASSWORD else ""}</nav></header>')
-        parts = [html.escape(site), f'<a href="{live}">Watch live</a>'] + extra
-        footer = "<footer>" + " · ".join(parts) + "</footer>"
+        # Same header as the Owncast page: logo, name, live/offline pill. The whole
+        # left side links back to the live page.
+        status = ('<span class="status live">● LIVE</span>' if rec.online
+                  else '<span class="status">● Offline<span class="soon"> · back soon</span></span>')
+        header = (f'<header><a href="{live}" title="Watch live"><img class="logo" src="{logo}" alt="" onerror="this.remove()">'
+                  f'<div class="brand"><b>{html.escape(site)}</b></div>{status}</a></header>')
+        parts = [f'<a href="{live}">Watch live</a>'] + extra + (
+            ['<a href="/vods/admin">Admin</a>'] if ADMIN_PASSWORD else [])
+        footer = "<footer>" + "".join(f"<span>{p}</span>" for p in parts) + "</footer>"
 
     stage = ""
+    if not vods and not embed:
+        # Nothing to play: mirror the offline Owncast page (banner, then the channel info).
+        tags = "".join(f'<span class="tag">#{html.escape(t)}</span>' for t in info.get("tags", []))
+        stage = (('<section class="bstage"><img src="/vods/banner" alt=""></section>' if info.get("banner") else "")
+                 + f'<section class="info"><img class="logo" src="{logo}" alt="" onerror="this.remove()">'
+                 f'<div class="txt"><h1>{html.escape(site)}</h1>'
+                 + (f'<p class="about">{_linkify(info["summary"])}</p>' if info.get("summary") else "")
+                 + (f'<div class="tags">{tags}</div>' if tags else "") + "</div></section>")
     if vods:
         tags = "".join(f'<span class="tag">#{html.escape(t)}</span>' for t in info.get("tags", []))
         side = ""
@@ -1612,6 +1656,7 @@ def render_page(authed: bool = True, embed: bool = False, host: str = "", viewer
     return _fill(
         PAGE,
         TITLE=html.escape(f"VODs · {site}"),
+        FONTS=info.get("fonts", ""),
         BODY_CLASS="embed" if embed else "",
         HEADER=header, STAGE=stage, FOOTER=footer,
         COUNT=count, FILTERS=filters, ROWS="\n".join(rows),
@@ -1827,6 +1872,12 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urllib.parse.urlparse(self.path)
             force_dl = "dl" in urllib.parse.parse_qs(parsed.query)
             return self.proxy_cloud(name, download=force_dl)
+        # /vods/banner  — the channel banner from Owncast's custom CSS
+        if path == "/vods/banner":
+            b = owncast_info().get("banner")
+            if not b:
+                return self._send(404, b"no banner")
+            return self._send(200, b[1], b[0], {"Cache-Control": "public, max-age=3600"})
         # /vods/thumb/<name>.jpg  — VOD thumbnail (public)
         if path.startswith("/vods/thumb/"):
             return self.serve_thumb(urllib.parse.unquote(path[len("/vods/thumb/"):]))
